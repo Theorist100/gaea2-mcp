@@ -209,13 +209,13 @@ impl Gaea2CLI {
             args.push("--verbose".to_string());
         }
 
-        tracing::info!(
-            "Running Gaea2: {:?} --Filename {:?} --resolution {} --buildpath {:?}",
-            self.gaea_path,
-            project_path,
-            resolution,
-            output_dir
-        );
+        // Log the command as it will actually run. Printing a fixed subset of the flags made a
+        // build look as if --node, --ignorecache and --verbose had been dropped on the way.
+        tracing::info!("Running Gaea2: {:?} {}", self.gaea_path, args.join(" "));
+
+        // What was already there, so "did this build write anything" can be answered by
+        // difference rather than by an exit code that does not survive the launch.
+        let files_before = find_output_files(&output_dir).await;
 
         let mut cmd = self.spawn_command(&args);
 
@@ -232,10 +232,14 @@ impl Gaea2CLI {
                 let crash_text = crash.as_ref().map(|(text, _)| text.clone());
                 let first_fault = crash.as_ref().and_then(|(_, fault)| fault.clone());
 
-                // Gaea can exit zero yet leave a crash log behind for a node that faulted, so
-                // the log decides as much as the exit code does.
-                if status.success() && first_fault.is_none() {
-                    let output_files = find_output_files(&output_dir).await;
+                let output_files = find_output_files(&output_dir).await;
+                let wrote_something = output_files.iter().any(|f| !files_before.contains(f));
+
+                // The exit code cannot be trusted here. Gaea needs its own console, which it
+                // gets through `cmd /c start /wait`, and `start` reports success regardless of
+                // what the child returned - a build that exits 1 arrives as 0. So a build counts
+                // as successful only when it actually produced a file and left no crash log.
+                if status.success() && first_fault.is_none() && wrote_something {
                     let file_count = output_files.len();
 
                     ExecutionResult {
@@ -250,11 +254,10 @@ impl Gaea2CLI {
                         stderr: crash_text,
                     }
                 } else {
-                    let output_files = find_output_files(&output_dir).await;
                     let file_count = output_files.len();
-                    let error = match (&first_fault, status.code()) {
-                        (Some(fault), _) => format!("Gaea2 build failed: {fault}"),
-                        (None, Some(code)) => format!(
+                    let error = match (&first_fault, status.code(), wrote_something) {
+                        (Some(fault), _, _) => format!("Gaea2 build failed: {fault}"),
+                        (None, Some(code), _) if code != 0 => format!(
                             "Gaea2 exited with code {}{}",
                             code,
                             if code == -532462766 {
@@ -264,7 +267,13 @@ impl Gaea2CLI {
                                 ""
                             }
                         ),
-                        (None, None) => "Gaea2 was terminated by a signal".to_string(),
+                        (None, _, false) => "Gaea2 finished without writing a single file and \
+                                             without a crash log. The graph computed nothing: \
+                                             check that the chain reaches the saved nodes and \
+                                             that the nodes feeding them produce data."
+                            .to_string(),
+                        (None, None, _) => "Gaea2 was terminated by a signal".to_string(),
+                        (None, Some(_), true) => "Gaea2 reported a failure".to_string(),
                     };
 
                     ExecutionResult {
