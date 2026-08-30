@@ -307,6 +307,8 @@ fn create_node_object(node: &Node, mut ref_id_counter: u32) -> Result<(Value, u3
                 // marks the ones that have settings with HasUI. Dropping them left the modifier
                 // in the file with none of the values the caller asked for.
                 for (key, value) in &m.properties {
+                    crate::schema::check_modifier_property(&m.modifier_type, key, value)
+                        .map_err(|e| format!("Node {}: {e}", node.id))?;
                     obj.insert(key.clone(), value.clone());
                 }
                 if m.has_ui || !m.properties.is_empty() {

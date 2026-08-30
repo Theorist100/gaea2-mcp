@@ -1507,6 +1507,7 @@ impl Tool for RepairProjectTool {
                 );
                 repair_intrinsic_modifiers(node, &id, &node_type, &mut next_id, &mut repairs);
                 report_property_ranges(node, &id, &node_type, &mut warnings);
+                report_modifier_problems(node, &id, &node_type, &mut warnings);
             }
         }
 
@@ -1740,6 +1741,74 @@ fn repair_intrinsic_modifiers(
     ));
 }
 
+/// Report modifiers that will not do what the file implies.
+///
+/// Two failures look identical from outside - a flat result and no error at all: a modifier
+/// setting that does not exist on that modifier, and a mask-style modifier on a node with
+/// nothing connected to it.
+fn report_modifier_problems(node: &Value, id: &str, node_type: &str, warnings: &mut Vec<String>) {
+    let Some(modifiers) = node
+        .get("Modifiers")
+        .and_then(|m| m.get("$values"))
+        .and_then(|v| v.as_array())
+    else {
+        return;
+    };
+
+    let has_input = node
+        .get("Ports")
+        .and_then(|p| p.get("$values"))
+        .and_then(|v| v.as_array())
+        .is_some_and(|ports| {
+            ports.iter().any(|port| {
+                port.get("Record").is_some()
+                    && port
+                        .get("Type")
+                        .and_then(Value::as_str)
+                        .is_some_and(|kind| kind.contains("In"))
+            })
+        });
+
+    for modifier in modifiers {
+        let Some(name) = modifier.get("Name").and_then(Value::as_str) else {
+            continue;
+        };
+
+        if !crate::schema::is_valid_modifier_type(name) {
+            warnings.push(format!(
+                "Node {id} ({node_type}): modifier '{name}' does not exist in Gaea {}",
+                crate::schema::GAEA_VERSION
+            ));
+            continue;
+        }
+
+        if crate::schema::modifier_uses_parent_input(name) && !has_input {
+            warnings.push(format!(
+                "Node {id} ({node_type}): the '{name}' modifier works off the node's input, but \
+                 nothing is connected to it - it will produce an empty result and the build will \
+                 report nothing"
+            ));
+        }
+
+        let Some(fields) = modifier.as_object() else {
+            continue;
+        };
+        for (key, value) in fields {
+            if key.starts_with('$')
+                || matches!(
+                    key.as_str(),
+                    "Name" | "Parent" | "Intrinsic" | "HasUI" | "Order"
+                )
+            {
+                continue;
+            }
+            if let Err(problem) = crate::schema::check_modifier_property(name, key, value) {
+                warnings.push(format!("Node {id} ({node_type}): {problem}"));
+            }
+        }
+    }
+}
+
 /// Note property values that fall outside the range the build declares.
 fn report_property_ranges(node: &Value, id: &str, node_type: &str, warnings: &mut Vec<String>) {
     let Some(obj) = node.as_object() else {
@@ -1875,9 +1944,11 @@ impl Tool for NodeInfoTool {
     }
 
     fn description(&self) -> &str {
-        "Describe node types of the installed Gaea build: category, ports in serialization order, \
-         intrinsic modifiers and properties with their declared ranges. Give a node_type for one \
-         node, or search/category to list matches."
+        "Describe node and modifier types of the installed Gaea build: category, ports in \
+         serialization order, intrinsic modifiers, and properties with their declared ranges, \
+         accepted enum members and interface labels. Give node_type for one node, modifier for \
+         one modifier, label to resolve an interface name such as 'Height Remap', or \
+         search/category to list."
     }
 
     fn schema(&self) -> Value {
@@ -1887,6 +1958,14 @@ impl Tool for NodeInfoTool {
                 "node_type": {
                     "type": "string",
                     "description": "Exact node type, e.g. 'Erosion2'"
+                },
+                "modifier": {
+                    "type": "string",
+                    "description": "Exact modifier type, e.g. 'Multiplier'. Pass '*' to list them all."
+                },
+                "label": {
+                    "type": "string",
+                    "description": "Interface label of a modifier setting, e.g. 'Height Remap', to find which modifier it belongs to"
                 },
                 "search": {
                     "type": "string",
@@ -1948,6 +2027,89 @@ impl Tool for NodeInfoTool {
                 "intrinsic_modifiers": modifiers,
                 "properties": properties
             })
+        }
+
+        /// Describe one modifier: what it does with the node it sits on, and what it accepts.
+        fn describe_modifier(modifier_type: &str) -> Value {
+            let properties: Vec<Value> = crate::schema::get_modifier_properties(modifier_type)
+                .iter()
+                .map(|p| {
+                    let allowed = crate::schema::enum_values(p.cs_type);
+                    let mut described = json!({
+                        "name": p.name,
+                        "type": p.cs_type,
+                        "default": p.default_value,
+                        "min": p.min,
+                        "max": p.max
+                    });
+                    if let Some(label) = p.label {
+                        described["label"] = json!(label);
+                    }
+                    if !allowed.is_empty() {
+                        described["values"] = json!(allowed);
+                    }
+                    described
+                })
+                .collect();
+
+            let reads_input = crate::schema::modifier_uses_parent_input(modifier_type);
+            json!({
+                "type": modifier_type,
+                "reads_node_input": reads_input,
+                "role": if reads_input {
+                    "Works off the node's input - a mask or a combiner. On a node with nothing \
+                     connected it produces an empty result, silently."
+                } else {
+                    "Transforms the node's own output; usable on a generator."
+                },
+                "properties": properties
+            })
+        }
+
+        // Resolve an interface label, e.g. "Height Remap" -> Multiplier.Value.
+        if let Some(label) = args.get("label").and_then(|v| v.as_str()) {
+            return match crate::schema::modifier_for_label(label) {
+                Some((modifier_type, property)) => {
+                    let mut described = describe_modifier(modifier_type);
+                    described["matched_label"] = json!(label);
+                    described["matched_property"] = json!(property.name);
+                    described["found"] = json!(true);
+                    ToolResult::json(&described)
+                },
+                None => ToolResult::json(&json!({
+                    "found": false,
+                    "label": label,
+                    "message": format!("No modifier setting is labelled '{label}' in Gaea {}",
+                                       crate::schema::GAEA_VERSION)
+                })),
+            };
+        }
+
+        if let Some(modifier) = args.get("modifier").and_then(|v| v.as_str()) {
+            if modifier == "*" {
+                let all: Vec<Value> = crate::schema::modifier_types()
+                    .iter()
+                    .map(|m| describe_modifier(m))
+                    .collect();
+                return ToolResult::json(&json!({
+                    "gaea_version": crate::schema::GAEA_VERSION,
+                    "count": all.len(),
+                    "modifiers": all
+                }));
+            }
+
+            if !crate::schema::is_valid_modifier_type(modifier) {
+                return ToolResult::json(&json!({
+                    "found": false,
+                    "modifier": modifier,
+                    "available": crate::schema::modifier_types()
+                }));
+            }
+
+            let mut described = describe_modifier(modifier);
+            described["found"] = json!(true);
+            described["gaea_version"] = json!(crate::schema::GAEA_VERSION);
+            return ToolResult::json(&described);
         }
 
         if let Some(node_type) = args.get("node_type").and_then(|v| v.as_str()) {

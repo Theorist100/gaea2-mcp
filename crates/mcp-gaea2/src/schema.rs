@@ -124,6 +124,140 @@ pub fn modifier_types() -> &'static [&'static str] {
     gen::MODIFIER_TYPES
 }
 
+/// Properties declared by a modifier type.
+pub fn get_modifier_properties(modifier_type: &str) -> &'static [NodeProperty] {
+    gen::MODIFIER_PROPERTIES
+        .iter()
+        .find(|(name, _)| *name == modifier_type)
+        .map(|(_, props)| *props)
+        .unwrap_or(&[])
+}
+
+/// Look up one property of a modifier type.
+pub fn find_modifier_property(
+    modifier_type: &str,
+    property: &str,
+) -> Option<&'static NodeProperty> {
+    get_modifier_properties(modifier_type)
+        .iter()
+        .find(|p| p.name == property)
+}
+
+/// Whether this modifier works off the input of the node it is attached to.
+///
+/// Masks by height or slope and combiners read `Parent.In`. On a generator, which has no input,
+/// they produce nothing - and the build reports nothing either.
+pub fn modifier_uses_parent_input(modifier_type: &str) -> bool {
+    gen::MODIFIERS_USING_PARENT_INPUT.contains(&modifier_type)
+}
+
+/// Find the modifier whose interface label matches, e.g. "Height Remap" -> `Multiplier`.
+///
+/// Gaea labels several modifier settings differently from their serialized names, and following
+/// the label to the wrong type is how a graph ends up flat: the "Height Remap" of a tutorial is
+/// `Multiplier.Value`, while the `Height` modifier is a mask over the node's input.
+pub fn modifier_for_label(label: &str) -> Option<(&'static str, &'static NodeProperty)> {
+    gen::MODIFIER_PROPERTIES.iter().find_map(|(name, props)| {
+        props
+            .iter()
+            .find(|p| p.label.is_some_and(|l| l.eq_ignore_ascii_case(label)))
+            .map(|p| (*name, p))
+    })
+}
+
+/// Check one property of a modifier: that it exists, and that its value fits the declaration.
+pub fn check_modifier_property(
+    modifier_type: &str,
+    property: &str,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    let declared = get_modifier_properties(modifier_type);
+    let Some(property_decl) = declared.iter().find(|p| p.name == property) else {
+        let known: Vec<&str> = declared.iter().map(|p| p.name).collect();
+        let hint = match modifier_for_label(property) {
+            Some((owner, decl)) if owner != modifier_type => format!(
+                " '{property}' is the interface label of {owner}.{}; use that modifier instead.",
+                decl.name
+            ),
+            _ => String::new(),
+        };
+        return Err(format!(
+            "Modifier {modifier_type} has no property '{property}'. Declared: {}.{hint}",
+            if known.is_empty() {
+                "none".to_string()
+            } else {
+                known.join(", ")
+            }
+        ));
+    };
+
+    // Enumerated settings follow the same rule as node properties: member name, never an ordinal.
+    let allowed = enum_values(property_decl.cs_type);
+    if !allowed.is_empty() {
+        return match value.as_str() {
+            Some(text) if allowed.contains(&text) => Ok(()),
+            _ => Err(format!(
+                "{modifier_type}.{property} is a {} and must be one of: {}",
+                property_decl.cs_type,
+                allowed.join(", ")
+            )),
+        };
+    }
+
+    match property_decl.cs_type {
+        "float" | "int" | "double" => {
+            let Some(actual) = value.as_f64() else {
+                return Err(format!(
+                    "{modifier_type}.{property} is {} and must be a number, not {value}",
+                    property_decl.cs_type
+                ));
+            };
+            if let (Some(min), Some(max)) = (property_decl.min, property_decl.max) {
+                if actual < min || actual > max {
+                    return Err(format!(
+                        "{modifier_type}.{property} is {actual}, outside its range {min}..{max}"
+                    ));
+                }
+            }
+            Ok(())
+        },
+        // A pair is written as an object with X and Y.
+        "Float2" => {
+            let Some(pair) = value.as_object() else {
+                return Err(format!(
+                    "{modifier_type}.{property} is a pair and must be written as an object with \
+                     X and Y, not {value}"
+                ));
+            };
+            for axis in ["X", "Y"] {
+                let Some(component) = pair.get(axis) else {
+                    continue;
+                };
+                let Some(actual) = component.as_f64() else {
+                    return Err(format!(
+                        "{modifier_type}.{property}.{axis} must be a number, not {component}"
+                    ));
+                };
+                if let (Some(min), Some(max)) = (property_decl.min, property_decl.max) {
+                    if actual < min || actual > max {
+                        return Err(format!(
+                            "{modifier_type}.{property}.{axis} is {actual}, outside {min}..{max}"
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        },
+        "bool" => match value.as_bool() {
+            Some(_) => Ok(()),
+            None => Err(format!(
+                "{modifier_type}.{property} is a flag and must be true or false, not {value}"
+            )),
+        },
+        _ => Ok(()),
+    }
+}
+
 /// Members of an enumerated property type, empty when the type is not an enumeration.
 pub fn enum_values(type_name: &str) -> &'static [&'static str] {
     gen::ENUM_VALUES
@@ -369,6 +503,45 @@ mod tests {
         // Plain numeric and unknown properties are left alone here.
         assert!(check_property_value("Rivers", "Water", &json!(0.5)).is_ok());
         assert!(check_property_value("Rivers", "NoSuchProperty", &json!(1)).is_ok());
+    }
+
+    #[test]
+    fn height_remap_resolves_to_the_multiplier() {
+        // Following the interface label to the Height modifier is what flattened a whole graph.
+        let (modifier, property) =
+            modifier_for_label("Height Remap").expect("the label exists in this build");
+        assert_eq!(modifier, "Multiplier");
+        assert_eq!(property.name, "Value");
+        assert_eq!(property.max, Some(4.0), "2.23 has to fit");
+    }
+
+    #[test]
+    fn mask_modifiers_are_marked_as_reading_the_input() {
+        assert!(modifier_uses_parent_input("Height"));
+        assert!(modifier_uses_parent_input("Slope"));
+        assert!(modifier_uses_parent_input("Max"));
+        // These transform the node's own output and are fine on a generator.
+        assert!(!modifier_uses_parent_input("Multiplier"));
+        assert!(!modifier_uses_parent_input("Blur"));
+        assert!(!modifier_uses_parent_input("Shaper"));
+    }
+
+    #[test]
+    fn modifier_properties_are_checked_by_name_and_type() {
+        use serde_json::json;
+
+        assert!(check_modifier_property("Blur", "Factor", &json!(0.7)).is_ok());
+        assert!(check_modifier_property("Multiplier", "Value", &json!({"Y": 2.23})).is_ok());
+        assert!(check_modifier_property("Height", "Range", &json!({"X": 0, "Y": 0.5})).is_ok());
+
+        // Out of the declared range: Height.Range is 0..1, so 2.23 does not belong there.
+        assert!(check_modifier_property("Height", "Range", &json!({"X": 0, "Y": 2.23})).is_err());
+        // A pair written as a bare number.
+        assert!(check_modifier_property("Multiplier", "Value", &json!(2.23)).is_err());
+        // A setting that belongs to another modifier, with a hint about which.
+        let err = check_modifier_property("Blur", "Height Remap", &json!(1))
+            .expect_err("Blur has no such setting");
+        assert!(err.contains("Multiplier"), "{err}");
     }
 
     #[test]

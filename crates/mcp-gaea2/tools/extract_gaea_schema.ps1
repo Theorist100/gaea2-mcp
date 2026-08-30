@@ -151,62 +151,101 @@ for ($i = 0; $i -lt $lines.Count; $i++) {
 }
 Write-Host "Enumerations: $($enumValues.Count)"
 
+$isModifier = @{}
+foreach ($n in $modifierNames) { $isModifier[$n] = $true }
+$modifierPropsOf = @{}
+$modifierUsesParentInput = @{}
+
 $currentClass = $null
+$currentIsModifier = $false
 $pendingCat = $null
 $pendingParam = $null
+$pendingName = $null
 
 for ($i = 0; $i -lt $lines.Count; $i++) {
     $line = $lines[$i]
 
     if ($line -match '\[Toolbox\(NodeCategory\.([A-Za-z]+)') { $pendingCat = $Matches[1]; continue }
     if ($line -match '\[Parameter\((.*)\)\]') { $pendingParam = $Matches[1]; continue }
+    # [Name("...")] on a property carries the label the user sees, which can differ from the
+    # serialized name entirely: Multiplier.Value is shown as "Height Remap".
+    if ($line -match '\[Name\("([^"]+)"\)\]') { $pendingName = $Matches[1]; continue }
 
-    if ($line -match '^\s*(?:public|internal)\s+(?:sealed\s+)?(?:abstract\s+)?class\s+([A-Za-z0-9_]+)\s*:') {
+    if ($line -match '^\s*(?:public|internal)\s+(?:sealed\s+)?(?:abstract\s+)?class\s+([A-Za-z0-9_]+)\s*:\s*([A-Za-z0-9_]+)') {
         $cls = $Matches[1]
-        if ($isNode.ContainsKey($cls)) {
+        $baseName = $Matches[2]
+
+        if ($baseName -eq 'Modifier' -and $isModifier.ContainsKey($cls)) {
             $currentClass = $cls
+            $currentIsModifier = $true
+            if (-not $modifierPropsOf.ContainsKey($cls)) {
+                $modifierPropsOf[$cls] = New-Object System.Collections.Generic.List[object]
+            }
+        } elseif ($isNode.ContainsKey($cls)) {
+            $currentClass = $cls
+            $currentIsModifier = $false
             if ($pendingCat) { $catOf[$cls] = $pendingCat }
             if (-not $propsOf.ContainsKey($cls)) {
                 $propsOf[$cls] = New-Object System.Collections.Generic.List[object]
             }
         } else {
             $currentClass = $null
+            $currentIsModifier = $false
         }
-        $pendingCat = $null; $pendingParam = $null
+        $pendingCat = $null; $pendingParam = $null; $pendingName = $null
         continue
+    }
+
+    # A modifier whose Process reads base.Parent.In works off the node's input. Put one on a
+    # generator, which has no input, and it yields nothing at all - Height on a Canyon made the
+    # whole graph flat with no error anywhere.
+    if ($currentClass -and $currentIsModifier -and $line -match 'base\.Parent\.In') {
+        $modifierUsesParentInput[$currentClass] = $true
     }
 
     if ($currentClass -and $line -match '^\s*public\s+([A-Za-z0-9_<>\[\]\.\?]+)\s+([A-Za-z0-9_]+)\s*$') {
         $csType = $Matches[1]; $propName = $Matches[2]
         # "public enum X" lands here as a property named after a nested enum - skip it
-        if ($csType -eq 'enum') { $pendingParam = $null; continue }
+        if ($csType -eq 'enum') { $pendingParam = $null; $pendingName = $null; continue }
 
-        if ($propName -eq 'Seed' -and -not $seedNodes.Contains($currentClass)) {
+        if (-not $currentIsModifier -and $propName -eq 'Seed' -and -not $seedNodes.Contains($currentClass)) {
             $seedNodes.Add($currentClass)
         }
 
         $def = $null; $min = $null; $max = $null
-        if ($pendingParam -and $csType -in @('float', 'int', 'double')) {
+        if ($pendingParam) {
             $nums = @()
             foreach ($a in ($pendingParam -split ',\s*')) {
                 $a = $a.Trim()
                 if ($a -match '^-?[0-9]+(\.[0-9]+)?f?$') { $nums += ($a -replace 'f$', '') }
             }
-            # only the canonical (default, min, max) triple with a sane range is trusted;
-            # other [Parameter] overloads put the numbers in a different order
-            if ($nums.Count -eq 3 -and [double]$nums[1] -lt [double]$nums[2]) {
-                $def = $nums[0]; $min = $nums[1]; $max = $nums[2]
+            if ($csType -in @('float', 'int', 'double')) {
+                # the canonical (default, min, max) triple; other overloads order them differently
+                if ($nums.Count -eq 3 -and [double]$nums[1] -lt [double]$nums[2]) {
+                    $def = $nums[0]; $min = $nums[1]; $max = $nums[2]
+                }
+            } elseif ($csType -eq 'Float2') {
+                # a pair carries (defaultX, defaultY, min, max) for both components
+                if ($nums.Count -eq 4 -and [double]$nums[2] -lt [double]$nums[3]) {
+                    $min = $nums[2]; $max = $nums[3]
+                }
             }
         }
-        $propsOf[$currentClass].Add([pscustomobject]@{
-                Name = $propName; CsType = $csType; Default = $def; Min = $min; Max = $max
-            })
-        $pendingParam = $null
+
+        $record = [pscustomobject]@{
+            Name = $propName; CsType = $csType; Default = $def; Min = $min; Max = $max
+            Label = $pendingName
+        }
+        if ($currentIsModifier) { $modifierPropsOf[$currentClass].Add($record) }
+        else { $propsOf[$currentClass].Add($record) }
+
+        $pendingParam = $null; $pendingName = $null
         continue
     }
 
-    if ($line.Trim() -and $line -notmatch '^\s*\[') { $pendingCat = $null; $pendingParam = $null }
+    if ($line.Trim() -and $line -notmatch '^\s*\[') { $pendingCat = $null; $pendingParam = $null; $pendingName = $null }
 }
+Write-Host "Modifiers reading the parent input: $($modifierUsesParentInput.Count)"
 Write-Host "Categorized: $($catOf.Count); with Seed: $($seedNodes.Count)"
 
 # ------------------------------------------------- 3. examples: port layout in serialized order
@@ -345,6 +384,16 @@ foreach ($n in ($modifierNames | Sort-Object)) { Add-Line "    `"$n`"," }
 Add-Line '];'
 Add-Line ''
 
+Add-Line '/// Modifiers whose Process reads the parent node''s input.'
+Add-Line '///'
+Add-Line '/// These work off what flows into the node: masks by height or slope, and combiners.'
+Add-Line '/// Attached to a generator, which has no input, they produce nothing - and nothing in the'
+Add-Line '/// build reports it. A Height modifier on a Canyon flattened an entire graph this way.'
+Add-Line 'pub static MODIFIERS_USING_PARENT_INPUT: &[&str] = &['
+foreach ($n in ($modifierUsesParentInput.Keys | Sort-Object)) { Add-Line "    `"$n`"," }
+Add-Line '];'
+Add-Line ''
+
 Add-Line "/// Nodes exposing a Seed property ($($seedNodes.Count))."
 Add-Line 'pub static SEEDED_NODES: &[&str] = &['
 foreach ($n in ($seedNodes | Sort-Object)) { Add-Line "    `"$n`"," }
@@ -379,7 +428,7 @@ Add-Line '];'
 Add-Line ''
 
 # properties
-Add-Line '/// A node property as declared by the installed build.'
+Add-Line '/// A node or modifier property as declared by the installed build.'
 Add-Line '#[derive(Debug, Clone, Copy, PartialEq)]'
 Add-Line 'pub struct NodeProperty {'
 Add-Line '    /// Property name as it appears in the serialized node.'
@@ -392,6 +441,9 @@ Add-Line '    /// Lower bound, when known.'
 Add-Line '    pub min: Option<f64>,'
 Add-Line '    /// Upper bound, when known.'
 Add-Line '    pub max: Option<f64>,'
+Add-Line '    /// Label shown in the Gaea interface, when it differs from the serialized name.'
+Add-Line '    /// Multiplier.Value, for one, is presented as "Height Remap".'
+Add-Line '    pub label: Option<&''static str>,'
 Add-Line '}'
 Add-Line ''
 Add-Line '/// Members of every enumeration a property can be typed by, in declaration order.'
@@ -407,19 +459,30 @@ foreach ($k in ($enumValues.Keys | Sort-Object)) {
 Add-Line '];'
 Add-Line ''
 
+function Format-Property($p) {
+    $dv = if ($null -ne $p.Default) { 'Some(' + $p.Default + '_f64)' } else { 'None' }
+    $mnv = if ($null -ne $p.Min) { 'Some(' + $p.Min + '_f64)' } else { 'None' }
+    $mxv = if ($null -ne $p.Max) { 'Some(' + $p.Max + '_f64)' } else { 'None' }
+    $lbl = if ($p.Label) { 'Some("' + $p.Label + '")' } else { 'None' }
+    "NodeProperty { name: `"$($p.Name)`", cs_type: `"$($p.CsType)`", default_value: $dv, min: $mnv, max: $mxv, label: $lbl }"
+}
+
 Add-Line '/// Properties per node type.'
 Add-Line 'pub static NODE_PROPERTIES: &[(&str, &[NodeProperty])] = &['
 foreach ($k in ($propsOf.Keys | Sort-Object)) {
     if ($propsOf[$k].Count -eq 0) { continue }
-    $items = @()
-    foreach ($p in $propsOf[$k]) {
-        $dv = if ($null -ne $p.Default) { 'Some(' + $p.Default + '_f64)' } else { 'None' }
-        $mnv = if ($null -ne $p.Min) { 'Some(' + $p.Min + '_f64)' } else { 'None' }
-        $mxv = if ($null -ne $p.Max) { 'Some(' + $p.Max + '_f64)' } else { 'None' }
-        $items += "NodeProperty { name: `"$($p.Name)`", cs_type: `"$($p.CsType)`", default_value: $dv, min: $mnv, max: $mxv }"
-    }
     Add-Line "    (`"$k`", &["
-    foreach ($it in $items) { Add-Line "        $it," }
+    foreach ($p in $propsOf[$k]) { Add-Line "        $(Format-Property $p)," }
+    Add-Line '    ]),'
+}
+Add-Line '];'
+Add-Line ''
+
+Add-Line '/// Properties per modifier type.'
+Add-Line 'pub static MODIFIER_PROPERTIES: &[(&str, &[NodeProperty])] = &['
+foreach ($k in ($modifierPropsOf.Keys | Sort-Object)) {
+    Add-Line "    (`"$k`", &["
+    foreach ($p in $modifierPropsOf[$k]) { Add-Line "        $(Format-Property $p)," }
     Add-Line '    ]),'
 }
 Add-Line '];'

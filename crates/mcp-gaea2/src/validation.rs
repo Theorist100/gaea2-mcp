@@ -94,6 +94,27 @@ impl Validator {
             }
         }
 
+        // A mask-style modifier reads the node's input. On a node nothing feeds, it yields
+        // nothing, and the whole branch below goes flat without a single error anywhere.
+        let fed: HashSet<i32> = fixed_connections.iter().map(|c| c.to_node).collect();
+        for node in &fixed_nodes {
+            let Some(modifiers) = &node.modifiers else {
+                continue;
+            };
+            if fed.contains(&node.id) {
+                continue;
+            }
+            for modifier in modifiers {
+                if crate::schema::modifier_uses_parent_input(&modifier.modifier_type) {
+                    warnings.push(format!(
+                        "Node {} ({}) has the '{}' modifier, which works off the node's input, \
+                         but nothing is connected to it; it will produce an empty result",
+                        node.id, node.node_type, modifier.modifier_type
+                    ));
+                }
+            }
+        }
+
         // Collect valid node IDs
         let valid_ids: HashSet<i32> = fixed_nodes.iter().map(|n| n.id).collect();
         let type_of: HashMap<i32, String> = fixed_nodes
