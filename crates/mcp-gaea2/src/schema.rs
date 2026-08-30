@@ -15,7 +15,9 @@ use std::sync::LazyLock;
 
 use crate::gaea_schema_generated as gen;
 
-pub use crate::gaea_schema_generated::{NodeProperty, PropertyUsage, GAEA_VERSION};
+pub use crate::gaea_schema_generated::{
+    NodeProperty, PropertyCondition, PropertyUsage, GAEA_VERSION,
+};
 
 /// Ports every node has unless the extracted table says otherwise.
 const FALLBACK_PORTS: &[(&str, &str)] = &[("In", "PrimaryIn"), ("Out", "PrimaryOut")];
@@ -134,6 +136,69 @@ pub fn node_keywords(node_type: &str) -> &'static [&'static str] {
         .find(|(name, _)| *name == node_type)
         .map(|(_, words)| *words)
         .unwrap_or(&[])
+}
+
+/// The condition under which a property of a node actually applies.
+///
+/// Returns the name of the property that switches it on and the values it has to hold. Outside
+/// them the value is accepted, written to the file and ignored: `Lake.SmallLakes` does nothing
+/// at all while `Type` is `Simple`, and half an afternoon can go into tuning it.
+pub fn property_condition(
+    node_type: &str,
+    property: &str,
+) -> Option<(&'static str, &'static [&'static str])> {
+    gen::PROPERTY_APPLIES_WHEN
+        .iter()
+        .find(|(node, _)| *node == node_type)
+        .and_then(|(_, rules)| {
+            rules
+                .iter()
+                .find(|(name, _, _)| *name == property)
+                .map(|(_, switch, values)| (*switch, *values))
+        })
+}
+
+/// Every mode-dependent property of a node.
+pub fn conditional_properties(node_type: &str) -> &'static [PropertyCondition] {
+    gen::PROPERTY_APPLIES_WHEN
+        .iter()
+        .find(|(node, _)| *node == node_type)
+        .map(|(_, rules)| *rules)
+        .unwrap_or(&[])
+}
+
+/// Warn about properties set while the mode they belong to is not selected.
+///
+/// This is not an error: the project still loads and builds. It is the quietest way to waste an
+/// afternoon, though, because nothing anywhere reports that the value went nowhere.
+pub fn check_property_conditions(
+    node_type: &str,
+    properties: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for (name, _) in properties.iter() {
+        let Some((switch, allowed)) = property_condition(node_type, name) else {
+            continue;
+        };
+        // What the switch is actually set to, or its declared default when the caller left it.
+        let selected = properties
+            .get(switch)
+            .and_then(|v| v.as_str().map(str::to_string))
+            .or_else(|| find_property(node_type, switch).and_then(|p| p.default_text.map(String::from)));
+
+        let Some(selected) = selected else {
+            continue;
+        };
+        if !allowed.iter().any(|value| *value == selected) {
+            warnings.push(format!(
+                "'{name}' of {node_type} only applies while {switch} is {}; it is {selected}, so \
+                 the value is written and ignored",
+                allowed.join(" or ")
+            ));
+        }
+    }
+    warnings.sort();
+    warnings
 }
 
 /// Whether a node has to be baked before it produces anything.
@@ -612,6 +677,43 @@ mod tests {
         // Plain numeric and unknown properties are left alone here.
         assert!(check_property_value("Rivers", "Water", &json!(0.5)).is_ok());
         assert!(check_property_value("Rivers", "NoSuchProperty", &json!(1)).is_ok());
+    }
+
+    #[test]
+    fn mode_dependent_properties_are_reported() {
+        use serde_json::json;
+
+        // Half of Lake's settings belong to the Advanced type and do nothing under Simple.
+        let (switch, allowed) =
+            property_condition("Lake", "SmallLakes").expect("SmallLakes is mode-dependent");
+        assert_eq!(switch, "Type");
+        assert_eq!(allowed, &["Advanced"]);
+
+        let mut properties = serde_json::Map::new();
+        properties.insert("Type".to_string(), json!("Simple"));
+        properties.insert("SmallLakes".to_string(), json!(0.7));
+        properties.insert("WaterLevel".to_string(), json!(0.02));
+        let warnings = check_property_conditions("Lake", &properties);
+        assert_eq!(warnings.len(), 1, "only SmallLakes is out of its mode: {warnings:?}");
+        assert!(warnings[0].contains("SmallLakes"), "{}", warnings[0]);
+
+        // Switching the mode moves the problem rather than removing it: WaterLevel belongs to
+        // Simple, so under Advanced it is the one being ignored.
+        properties.insert("Type".to_string(), json!("Advanced"));
+        let warnings = check_property_conditions("Lake", &properties);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("WaterLevel"), "{}", warnings[0]);
+
+        // A property in its own mode is not reported.
+        let mut clean = serde_json::Map::new();
+        clean.insert("Type".to_string(), json!("Advanced"));
+        clean.insert("SmallLakes".to_string(), json!(0.7));
+        assert!(check_property_conditions("Lake", &clean).is_empty());
+
+        // A node with no mode-dependent properties never warns.
+        let mut plain = serde_json::Map::new();
+        plain.insert("Scale".to_string(), json!(0.5));
+        assert!(check_property_conditions("Perlin", &plain).is_empty());
     }
 
     #[test]

@@ -2052,6 +2052,16 @@ impl Tool for NodeInfoTool {
                     if !allowed.is_empty() {
                         described["values"] = json!(allowed);
                     }
+                    // Half the properties of some nodes only apply in one of their modes, and
+                    // outside it the value is accepted and ignored.
+                    if let Some((switch, allowed)) =
+                        crate::schema::property_condition(node_type, p.name)
+                    {
+                        described["applies_when"] = json!({
+                            "property": switch,
+                            "is": allowed,
+                        });
+                    }
                     // What the shipped scenes chose, which the declared range cannot tell you.
                     if let Some(u) = crate::schema::find_property_usage(node_type, p.name) {
                         let mut seen = json!({"times_set": u.times_set});

@@ -115,6 +115,17 @@ impl Validator {
             }
         }
 
+        // A property that belongs to a mode the node is not in is accepted, written and then
+        // ignored. Nothing reports it - not the build, not the file, not the result - so four
+        // settings of Lake were tuned for an afternoon while only WaterLevel was doing anything.
+        for node in &fixed_nodes {
+            let properties: serde_json::Map<String, serde_json::Value> =
+                node.properties.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            for warning in crate::schema::check_property_conditions(&node.node_type, &properties) {
+                warnings.push(format!("Node {}: {warning}", node.id));
+            }
+        }
+
         // Collect valid node IDs
         let valid_ids: HashSet<i32> = fixed_nodes.iter().map(|n| n.id).collect();
         let type_of: HashMap<i32, String> = fixed_nodes

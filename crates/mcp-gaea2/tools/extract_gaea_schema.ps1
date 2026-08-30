@@ -117,6 +117,89 @@ Write-Host "Modifier classes: $($modifierNames.Count)"
 $isNode = @{}
 foreach ($n in $nodeNames) { $isNode[$n] = $true }
 
+# --------------------------------------- 1b. reflection: which properties depend on which
+#
+# A property can be declared, validated, written to the file and then ignored, because the node
+# only reads it in one of its modes. Crater.Rim and Crater.Shape do nothing while Style is New;
+# the value is accepted everywhere along the way and changes nothing, which is indistinguishable
+# from a broken graph.
+#
+# Gaea already knows this: every node with mode-dependent settings implements UpdateUI(), which
+# fills a VisibilityTable of property name to visible. Driving that method with each value of
+# each enumerated property reads the dependency graph straight out of the build - no parsing of
+# the obfuscated string table required.
+
+$visibilityOf = @{}
+
+# Section 1 reads metadata without loading anything; driving UpdateUI needs the real assembly.
+try {
+    $runtimeAsm = [System.Reflection.Assembly]::LoadFrom($dll)
+} catch {
+    Write-Warning "Cannot load $dll for reflection: $($_.Exception.Message)"
+    $runtimeAsm = $null
+}
+
+$nodeTypes = if ($runtimeAsm) {
+    $runtimeAsm.GetTypes() | Where-Object { $isNode.ContainsKey($_.Name) }
+} else {
+    @()
+}
+foreach ($type in $nodeTypes) {
+    $updateUI = $type.GetMethod('UpdateUI', [System.Reflection.BindingFlags]'Instance,NonPublic,Public')
+    if (-not $updateUI) { continue }
+    $visProperty = $type.GetProperty('VisibilityTable')
+    if (-not $visProperty) { continue }
+
+    try { $instance = [System.Activator]::CreateInstance($type) } catch { continue }
+
+    # The table is created when a node joins a graph, so a bare instance has none.
+    try { $visProperty.SetValue($instance, [System.Activator]::CreateInstance($visProperty.PropertyType)) }
+    catch { continue }
+
+    # Only enumerated properties can act as the switch; numeric conditions (Uplift.Jitter needs
+    # Passes > 1) live in the process code and are out of reach here.
+    $switches = $type.GetProperties() | Where-Object {
+        $_.PropertyType.IsEnum -and ($_.GetCustomAttributesData() | Where-Object {
+            $_.AttributeType.Name -eq 'ParameterAttribute' })
+    }
+    if (-not $switches) { continue }
+
+    $dependencies = @{}
+    foreach ($switch in $switches) {
+        $members = [System.Enum]::GetNames($switch.PropertyType)
+        if ($members.Count -lt 2) { continue }
+        $visibleUnder = @{}
+        $sawTable = $false
+        foreach ($member in $members) {
+            try {
+                $switch.SetValue($instance, [System.Enum]::Parse($switch.PropertyType, $member))
+                [void]$updateUI.Invoke($instance, @())
+            } catch { continue }
+            $table = $visProperty.GetValue($instance)
+            if (-not $table -or $table.Count -eq 0) { continue }
+            $sawTable = $true
+            foreach ($key in $table.Keys) {
+                if (-not $visibleUnder.ContainsKey($key)) { $visibleUnder[$key] = @() }
+                if ($table[$key]) { $visibleUnder[$key] += $member }
+            }
+        }
+        if (-not $sawTable) { continue }
+        foreach ($key in $visibleUnder.Keys) {
+            # Visible under every value means the switch does not gate it.
+            $seen = @($visibleUnder[$key]).Count
+            if ($seen -eq 0 -or $seen -eq $members.Count) { continue }
+            $dependencies[$key] = [pscustomobject]@{
+                Switch = $switch.Name
+                VisibleWhen = ($visibleUnder[$key] | Sort-Object)
+            }
+        }
+    }
+    # A hashtable indexed by property name answers .Count with the property called Count when a
+    # node happens to have one - TreeCount is not it, but Trees.Count is. Ask the keys instead.
+    if (@($dependencies.Keys).Count -gt 0) { $visibilityOf[$type.Name] = $dependencies }
+}
+Write-Host "Nodes with mode-dependent properties: $(@($visibilityOf.Keys).Count)"
+
 # ------------------------------------------- 2. decompilation: categories and parameter ranges
 
 $decompDir = Join-Path $WorkDir 'decomp'
@@ -554,6 +637,29 @@ Add-Line ''
 Add-Line "/// Short code Gaea itself uses for a node ($($shortCodeOf.Count))."
 Add-Line 'pub static NODE_SHORT_CODES: &[(&str, &str)] = &['
 foreach ($n in ($shortCodeOf.Keys | Sort-Object)) { Add-Line "    (`"$n`", `"$($shortCodeOf[$n])`")," }
+Add-Line '];'
+Add-Line ''
+
+Add-Line '/// One rule: the property, the property that switches it on, and the values it must hold.'
+Add-Line 'pub type PropertyCondition = (&''static str, &''static str, &''static [&''static str]);'
+Add-Line ''
+Add-Line "/// Properties that only apply in some of a node's modes ($(@($visibilityOf.Keys).Count) nodes)."
+Add-Line '///'
+Add-Line '/// Reads as: this property of this node only takes effect while that property holds one'
+Add-Line '/// of these values. Outside them the value is accepted, written to the file and ignored -'
+Add-Line '/// Crater.Rim and Crater.Shape do nothing at all while Style is New, which looks exactly'
+Add-Line '/// like a node that is not working. Taken from the visibility table Gaea builds for its'
+Add-Line '/// own interface, so it cannot drift from the product.'
+Add-Line 'pub static PROPERTY_APPLIES_WHEN: &[(&str, &[PropertyCondition])] = &['
+foreach ($n in ($visibilityOf.Keys | Sort-Object)) {
+    $entries = @()
+    foreach ($prop in ($visibilityOf[$n].Keys | Sort-Object)) {
+        $dep = $visibilityOf[$n][$prop]
+        $values = ($dep.VisibleWhen | ForEach-Object { "`"$_`"" }) -join ', '
+        $entries += "(`"$prop`", `"$($dep.Switch)`", &[$values])"
+    }
+    Add-Line "    (`"$n`", &[$($entries -join ', ')]),"
+}
 Add-Line '];'
 Add-Line ''
 
