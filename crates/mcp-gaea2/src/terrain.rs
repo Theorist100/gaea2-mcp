@@ -115,7 +115,10 @@ pub fn load(path: &Path) -> Result<Heightfield, String> {
 
 fn read_png(path: &Path) -> Result<Vec<f64>, String> {
     let file = std::fs::File::open(path).map_err(|e| format!("Cannot read {path:?}: {e}"))?;
-    let decoder = png::Decoder::new(std::io::BufReader::new(file));
+    let mut decoder = png::Decoder::new(std::io::BufReader::new(file));
+    // Gaea writes its PNG8 outputs with a palette, so the samples only become readable once the
+    // palette is expanded. Sub-byte greyscale is expanded for the same reason.
+    decoder.set_transformations(png::Transformations::EXPAND);
     let mut reader = decoder
         .read_info()
         .map_err(|e| format!("Not a readable PNG: {e}"))?;
@@ -130,8 +133,10 @@ fn read_png(path: &Path) -> Result<Vec<f64>, String> {
         png::ColorType::GrayscaleAlpha => 2,
         png::ColorType::Rgb => 3,
         png::ColorType::Rgba => 4,
+        // EXPAND turns a palette into RGB before the frame is handed over, so this is unreachable
+        // unless the decoder changes behaviour.
         png::ColorType::Indexed => {
-            return Err("Indexed PNGs are not heightfields".to_string());
+            return Err("The palette in this PNG was not expanded".to_string());
         },
     };
 

@@ -133,6 +133,12 @@ $catOf = @{}
 $propsOf = @{}
 $enumValues = @{}
 $seedNodes = New-Object System.Collections.Generic.List[string]
+# Class-level attributes the tool box itself reads: the family a node belongs to, the words it
+# answers to in search, its short code, and whether it has to be baked before it yields anything.
+$familyOf = @{}
+$keywordsOf = @{}
+$shortCodeOf = @{}
+$requiresBaking = @{}
 
 # Enumerations first: a property typed by one of these must be written as the member NAME.
 # Writing the ordinal instead makes Gaea fail to load the node, and the build then exits with
@@ -161,11 +167,27 @@ $currentIsModifier = $false
 $pendingCat = $null
 $pendingParam = $null
 $pendingName = $null
+$pendingFamily = $null
+$pendingKeywords = $null
+$pendingShortCode = $null
+$pendingBaking = $false
+$pendingCurve = $null
 
 for ($i = 0; $i -lt $lines.Count; $i++) {
     $line = $lines[$i]
 
     if ($line -match '\[Toolbox\(NodeCategory\.([A-Za-z]+)') { $pendingCat = $Matches[1]; continue }
+    if ($line -match '\[Family\("([^"]+)"\)\]') { $pendingFamily = $Matches[1]; continue }
+    if ($line -match '\[ShortCode\("([^"]+)"\)\]') { $pendingShortCode = $Matches[1]; continue }
+    if ($line -match '\[RequiresBaking\]') { $pendingBaking = $true; continue }
+    if ($line -match '\[Keywords\(new string\[\]\s*\{([^}]*)\}') {
+        $pendingKeywords = @()
+        foreach ($m in [regex]::Matches($Matches[1], '"([^"]*)"')) { $pendingKeywords += $m.Groups[1].Value }
+        continue
+    }
+    # A curved property does not move linearly under the slider, so a value read as "42% of the
+    # range" is not what the node receives.
+    if ($line -match '\[Curve\(([-0-9.]+)f?\)\]') { $pendingCurve = $Matches[1]; continue }
     if ($line -match '\[Parameter\((.*)\)\]') { $pendingParam = $Matches[1]; continue }
     # [Name("...")] on a property carries the label the user sees, which can differ from the
     # serialized name entirely: Multiplier.Value is shown as "Height Remap".
@@ -185,6 +207,10 @@ for ($i = 0; $i -lt $lines.Count; $i++) {
             $currentClass = $cls
             $currentIsModifier = $false
             if ($pendingCat) { $catOf[$cls] = $pendingCat }
+            if ($pendingFamily) { $familyOf[$cls] = $pendingFamily }
+            if ($pendingShortCode) { $shortCodeOf[$cls] = $pendingShortCode }
+            if ($pendingKeywords -and $pendingKeywords.Count -gt 0) { $keywordsOf[$cls] = $pendingKeywords }
+            if ($pendingBaking) { $requiresBaking[$cls] = $true }
             if (-not $propsOf.ContainsKey($cls)) {
                 $propsOf[$cls] = New-Object System.Collections.Generic.List[object]
             }
@@ -193,6 +219,8 @@ for ($i = 0; $i -lt $lines.Count; $i++) {
             $currentIsModifier = $false
         }
         $pendingCat = $null; $pendingParam = $null; $pendingName = $null
+        $pendingFamily = $null; $pendingKeywords = $null; $pendingShortCode = $null
+        $pendingBaking = $false; $pendingCurve = $null
         continue
     }
 
@@ -212,12 +240,22 @@ for ($i = 0; $i -lt $lines.Count; $i++) {
             $seedNodes.Add($currentClass)
         }
 
-        $def = $null; $min = $null; $max = $null
+        $def = $null; $min = $null; $max = $null; $defText = $null
         if ($pendingParam) {
+            $parts = @($pendingParam -split ',\s*' | ForEach-Object { $_.Trim() })
             $nums = @()
-            foreach ($a in ($pendingParam -split ',\s*')) {
-                $a = $a.Trim()
+            foreach ($a in $parts) {
                 if ($a -match '^-?[0-9]+(\.[0-9]+)?f?$') { $nums += ($a -replace 'f$', '') }
+            }
+
+            # An enumerated or boolean property declares its default through a different overload:
+            # the first argument names the editor to show, the second carries the value. Reading
+            # only the numeric triple loses every enum default in the build.
+            if ($parts.Count -ge 2 -and $parts[0] -match '^Parameters\.') {
+                if ($parts[1] -match '^[A-Za-z0-9_]+\.([A-Za-z0-9_]+)$') { $defText = $Matches[1] }
+                elseif ($parts[1] -in @('true', 'false')) { $defText = $parts[1] }
+            } elseif ($csType -eq 'bool' -and $parts.Count -ge 1 -and $parts[0] -in @('true', 'false')) {
+                $defText = $parts[0]
             }
             if ($csType -in @('float', 'int', 'double')) {
                 # the canonical (default, min, max) triple; other overloads order them differently
@@ -234,19 +272,24 @@ for ($i = 0; $i -lt $lines.Count; $i++) {
 
         $record = [pscustomobject]@{
             Name = $propName; CsType = $csType; Default = $def; Min = $min; Max = $max
-            Label = $pendingName
+            Label = $pendingName; DefaultText = $defText; Curve = $pendingCurve
         }
         if ($currentIsModifier) { $modifierPropsOf[$currentClass].Add($record) }
         else { $propsOf[$currentClass].Add($record) }
 
-        $pendingParam = $null; $pendingName = $null
+        $pendingParam = $null; $pendingName = $null; $pendingCurve = $null
         continue
     }
 
-    if ($line.Trim() -and $line -notmatch '^\s*\[') { $pendingCat = $null; $pendingParam = $null; $pendingName = $null }
+    if ($line.Trim() -and $line -notmatch '^\s*\[') {
+        $pendingCat = $null; $pendingParam = $null; $pendingName = $null
+        $pendingFamily = $null; $pendingKeywords = $null; $pendingShortCode = $null
+        $pendingBaking = $false; $pendingCurve = $null
+    }
 }
 Write-Host "Modifiers reading the parent input: $($modifierUsesParentInput.Count)"
 Write-Host "Categorized: $($catOf.Count); with Seed: $($seedNodes.Count)"
+Write-Host "Families: $($familyOf.Count); keywords: $($keywordsOf.Count); short codes: $($shortCodeOf.Count); requiring baking: $($requiresBaking.Count)"
 
 # ------------------------------------------------- 3. examples: port layout in serialized order
 
@@ -300,12 +343,105 @@ function Read-PortLayouts($obj) {
     }
 }
 
+# What the shipped scenes actually do, as opposed to what the schema permits. The declared range
+# of a property says 0.001..10; it does not say that every author who touched it stayed near 2.
+# Without this, a caller setting a value has nothing to aim at but the midpoint of a range.
+$usageCount = @{}          # node type -> how many times it appears
+$propObserved = @{}        # node type -> property -> list of values seen
+$edgeCount = @{}           # "FromType:FromPort->ToType:ToPort" -> how many times
+
+# Bookkeeping that belongs to the node object itself, not to what the node computes.
+$structuralKeys = @(
+    'Id', 'Name', 'Version', 'Ports', 'Modifiers', 'NodeSize', 'Position', 'State',
+    'ExportState', 'LastError', 'GraphIndex', 'IsExpanded', 'StateOverride', 'IgnoreUnderlay',
+    'IsLocked', 'RenderIntentOverride', 'SaveDefinition', 'SaveDefinitions', 'Thumbprint',
+    'Gizmos', 'Group', 'Metadata', 'BuildOrder'
+)
+
+function Read-Usage($obj, $nodesById, $records) {
+    if ($null -eq $obj) { return }
+    if ($obj -is [System.Object[]]) {
+        foreach ($item in $obj) { Read-Usage $item $nodesById $records }
+        return
+    }
+    if ($obj -isnot [System.Management.Automation.PSCustomObject]) { return }
+
+    $props = $obj.PSObject.Properties
+    $typeProp = $props | Where-Object { $_.Name -eq '$type' }
+    if ($typeProp -and $typeProp.Value -is [string] -and
+        $typeProp.Value -match '^QuadSpinner\.Gaea\.Nodes\.([A-Za-z0-9_]+), Gaea\.Nodes$') {
+        $nodeType = $Matches[1]
+
+        if (-not $usageCount.ContainsKey($nodeType)) { $usageCount[$nodeType] = 0 }
+        $usageCount[$nodeType]++
+
+        $idProp = $props | Where-Object { $_.Name -eq 'Id' }
+        if ($idProp -and $null -ne $idProp.Value) { $nodesById[[string]$idProp.Value] = $nodeType }
+
+        foreach ($p in $props) {
+            if ($p.Name.StartsWith('$') -or $p.Name -in $structuralKeys) { continue }
+            $v = $p.Value
+            if ($v -is [System.Management.Automation.PSCustomObject] -or $v -is [System.Object[]]) { continue }
+            if ($null -eq $v) { continue }
+            if (-not $propObserved.ContainsKey($nodeType)) { $propObserved[$nodeType] = @{} }
+            if (-not $propObserved[$nodeType].ContainsKey($p.Name)) {
+                $propObserved[$nodeType][$p.Name] = New-Object System.Collections.Generic.List[object]
+            }
+            $propObserved[$nodeType][$p.Name].Add($v)
+        }
+
+        $portsProp = $props | Where-Object { $_.Name -eq 'Ports' }
+        if ($portsProp -and $portsProp.Value) {
+            $vals = $portsProp.Value.PSObject.Properties | Where-Object { $_.Name -eq '$values' }
+            if ($vals -and $vals.Value) {
+                foreach ($pt in $vals.Value) {
+                    $rec = ($pt.PSObject.Properties | Where-Object { $_.Name -eq 'Record' }).Value
+                    if (-not $rec) { continue }
+                    $rp = $rec.PSObject.Properties
+                    $from = ($rp | Where-Object { $_.Name -eq 'From' }).Value
+                    $to = ($rp | Where-Object { $_.Name -eq 'To' }).Value
+                    $fromPort = ($rp | Where-Object { $_.Name -eq 'FromPort' }).Value
+                    $toPort = ($rp | Where-Object { $_.Name -eq 'ToPort' }).Value
+                    if ($null -ne $from -and $null -ne $to) {
+                        $records.Add([pscustomobject]@{
+                            From = [string]$from; To = [string]$to
+                            FromPort = $fromPort; ToPort = $toPort
+                        })
+                    }
+                }
+            }
+        }
+    }
+
+    foreach ($p in $props) {
+        $v = $p.Value
+        if ($v -is [System.Management.Automation.PSCustomObject] -or $v -is [System.Object[]]) {
+            Read-Usage $v $nodesById $records
+        }
+    }
+}
+
 if (Test-Path $examplesDir) {
+    $sceneCount = 0
     foreach ($f in (Get-ChildItem $examplesDir -Filter '*.terrain' -Recurse)) {
         try { $json = [System.IO.File]::ReadAllText($f.FullName) | ConvertFrom-Json } catch { continue }
         Read-PortLayouts $json
+        $sceneCount++
+
+        # Connections name their endpoints by node id, so the types behind them are only known
+        # once the whole scene has been walked.
+        $nodesById = @{}
+        $records = New-Object System.Collections.Generic.List[object]
+        Read-Usage $json $nodesById $records
+        foreach ($r in $records) {
+            if (-not $nodesById.ContainsKey($r.From) -or -not $nodesById.ContainsKey($r.To)) { continue }
+            $key = "$($nodesById[$r.From]):$($r.FromPort)->$($nodesById[$r.To]):$($r.ToPort)"
+            if (-not $edgeCount.ContainsKey($key)) { $edgeCount[$key] = 0 }
+            $edgeCount[$key]++
+        }
     }
     Write-Host "Port layouts from examples: $($variants.Count) node types"
+    Write-Host "Usage from $sceneCount scenes: $($usageCount.Count) node types, $($edgeCount.Count) distinct connections"
 } else {
     Write-Warning "No Examples directory at '$examplesDir'; port table will be minimal."
 }
@@ -400,6 +536,39 @@ foreach ($n in ($seedNodes | Sort-Object)) { Add-Line "    `"$n`"," }
 Add-Line '];'
 Add-Line ''
 
+Add-Line "/// Nodes that have to be baked before they yield anything ($($requiresBaking.Count))."
+Add-Line '///'
+Add-Line '/// Built on their own they can finish without writing a file and without an error, which'
+Add-Line '/// reads as a broken graph rather than a node that needs the rest of the chain.'
+Add-Line 'pub static NODES_REQUIRING_BAKING: &[&str] = &['
+foreach ($n in ($requiresBaking.Keys | Sort-Object)) { Add-Line "    `"$n`"," }
+Add-Line '];'
+Add-Line ''
+
+Add-Line "/// The family each node belongs to, a second axis beside the tool box category ($($familyOf.Count))."
+Add-Line 'pub static NODE_FAMILY: &[(&str, &str)] = &['
+foreach ($n in ($familyOf.Keys | Sort-Object)) { Add-Line "    (`"$n`", `"$($familyOf[$n])`")," }
+Add-Line '];'
+Add-Line ''
+
+Add-Line "/// Short code Gaea itself uses for a node ($($shortCodeOf.Count))."
+Add-Line 'pub static NODE_SHORT_CODES: &[(&str, &str)] = &['
+foreach ($n in ($shortCodeOf.Keys | Sort-Object)) { Add-Line "    (`"$n`", `"$($shortCodeOf[$n])`")," }
+Add-Line '];'
+Add-Line ''
+
+Add-Line "/// Search words a node answers to in the tool box ($($keywordsOf.Count))."
+Add-Line '///'
+Add-Line '/// Searching node names alone misses these: Dusting answers to "snow", Glacier to "ice",'
+Add-Line '/// Hemisphere to "dome", Heal to "reconstruct".'
+Add-Line 'pub static NODE_KEYWORDS: &[(&str, &[&str])] = &['
+foreach ($n in ($keywordsOf.Keys | Sort-Object)) {
+    $items = ($keywordsOf[$n] | ForEach-Object { "`"$_`"" }) -join ', '
+    Add-Line "    (`"$n`", &[$items]),"
+}
+Add-Line '];'
+Add-Line ''
+
 # ports
 Add-Line '/// Port layout, in the order Gaea serializes it. Order matters: nodes address their'
 Add-Line '/// inputs positionally, so a reordered list can fault the build.'
@@ -427,6 +596,110 @@ foreach ($k in ($intrinsicModifiers.Keys | Sort-Object)) {
 Add-Line '];'
 Add-Line ''
 
+# what the shipped scenes do
+Add-Line '/// How often each node appears across the scenes Gaea ships.'
+Add-Line '///'
+Add-Line '/// A node used in forty scenes is a staple; one used in a single scene is a specialist.'
+Add-Line 'pub static NODE_USAGE: &[(&str, u32)] = &['
+foreach ($n in ($usageCount.Keys | Sort-Object)) { Add-Line "    (`"$n`", $($usageCount[$n]))," }
+Add-Line '];'
+Add-Line ''
+
+Add-Line '/// A property as the shipped scenes actually set it.'
+Add-Line '#[derive(Debug, Clone, Copy, PartialEq)]'
+Add-Line 'pub struct PropertyUsage {'
+Add-Line '    /// Property name.'
+Add-Line '    pub name: &''static str,'
+Add-Line '    /// How many times an author set it explicitly.'
+Add-Line '    pub times_set: u32,'
+Add-Line '    /// Lowest value seen, for numeric properties.'
+Add-Line '    pub low: Option<f64>,'
+Add-Line '    /// Middle value seen, for numeric properties: what to aim at without other guidance.'
+Add-Line '    pub median: Option<f64>,'
+Add-Line '    /// Highest value seen, for numeric properties.'
+Add-Line '    pub high: Option<f64>,'
+Add-Line '    /// Most frequent value, for properties that are not numeric.'
+Add-Line '    pub most_common: Option<&''static str>,'
+Add-Line '}'
+Add-Line ''
+
+# Every number here has to be read and written in the invariant culture. On a machine whose
+# locale writes a decimal comma, round-tripping a value through the current culture turns
+# 0.178 into "0,178", which then fails to parse as a number and lands in the text branch -
+# and would emit Rust that does not compile.
+$invariant = [System.Globalization.CultureInfo]::InvariantCulture
+
+function ConvertTo-InvariantNumber($v) {
+    if ($v -is [bool]) { return $null }
+    if ($v -is [double] -or $v -is [single] -or $v -is [int] -or $v -is [long] -or $v -is [decimal]) {
+        return [double]$v
+    }
+    $d = 0.0
+    if ([double]::TryParse([string]$v, [System.Globalization.NumberStyles]::Float, $invariant, [ref]$d)) {
+        return $d
+    }
+    return $null
+}
+
+function Format-Usage($name, $values) {
+    $times = $values.Count
+    $nums = @()
+    $allNumeric = $true
+    foreach ($v in $values) {
+        $n = ConvertTo-InvariantNumber $v
+        if ($null -eq $n) { $allNumeric = $false; break }
+        $nums += $n
+    }
+
+    if ($allNumeric -and $nums.Count -gt 0) {
+        $sorted = $nums | Sort-Object
+        $mid = $sorted[[int]([Math]::Floor($sorted.Count / 2))]
+        $lo = $sorted[0]; $hi = $sorted[$sorted.Count - 1]
+        $f = { param($x) ([Math]::Round($x, 4)).ToString($invariant) }
+        return "PropertyUsage { name: `"$name`", times_set: $times, low: Some($(& $f $lo)_f64), median: Some($(& $f $mid)_f64), high: Some($(& $f $hi)_f64), most_common: None }"
+    }
+
+    $texts = $values | ForEach-Object {
+        if ($_ -is [bool]) { if ($_) { 'true' } else { 'false' } }
+        elseif ($_ -is [double] -or $_ -is [single] -or $_ -is [decimal]) { ([double]$_).ToString($invariant) }
+        else { [string]$_ }
+    }
+    $top = $texts | Group-Object | Sort-Object -Property Count -Descending | Select-Object -First 1
+    $tv = ([string]$top.Name).Replace('\', '\\').Replace('"', '\"')
+    return "PropertyUsage { name: `"$name`", times_set: $times, low: None, median: None, high: None, most_common: Some(`"$tv`") }"
+}
+
+Add-Line '/// Per node, how the shipped scenes set its properties.'
+Add-Line '///'
+Add-Line '/// The declared range says what is allowed; this says what was chosen. Aiming at the middle'
+Add-Line '/// of a declared range is how a caller lands on a value no author has ever used.'
+Add-Line 'pub static PROPERTY_USAGE: &[(&str, &[PropertyUsage])] = &['
+foreach ($t in ($propObserved.Keys | Sort-Object)) {
+    $entries = @()
+    foreach ($pn in ($propObserved[$t].Keys | Sort-Object)) {
+        $entries += Format-Usage $pn $propObserved[$t][$pn]
+    }
+    if ($entries.Count -eq 0) { continue }
+    Add-Line "    (`"$t`", &["
+    foreach ($e in $entries) { Add-Line "        $e," }
+    Add-Line '    ]),'
+}
+Add-Line '];'
+Add-Line ''
+
+Add-Line '/// Connections the shipped scenes make, most frequent first.'
+Add-Line '///'
+Add-Line '/// Reads as: this node, out of this port, into that node, at that port, this many times.'
+Add-Line '/// Answers "what usually follows X", which no amount of schema can.'
+Add-Line 'pub static COMMON_CONNECTIONS: &[(&str, &str, &str, &str, u32)] = &['
+$ranked = $edgeCount.GetEnumerator() | Where-Object { $_.Value -ge 2 } | Sort-Object -Property Value -Descending
+foreach ($e in $ranked) {
+    if ($e.Key -notmatch '^([^:]+):([^-]*)->([^:]+):(.*)$') { continue }
+    Add-Line "    (`"$($Matches[1])`", `"$($Matches[2])`", `"$($Matches[3])`", `"$($Matches[4])`", $($e.Value)),"
+}
+Add-Line '];'
+Add-Line ''
+
 # properties
 Add-Line '/// A node or modifier property as declared by the installed build.'
 Add-Line '#[derive(Debug, Clone, Copy, PartialEq)]'
@@ -444,6 +717,11 @@ Add-Line '    pub max: Option<f64>,'
 Add-Line '    /// Label shown in the Gaea interface, when it differs from the serialized name.'
 Add-Line '    /// Multiplier.Value, for one, is presented as "Height Remap".'
 Add-Line '    pub label: Option<&''static str>,'
+Add-Line '    /// Default for a property that is not numeric: an enumeration member, or true/false.'
+Add-Line '    pub default_text: Option<&''static str>,'
+Add-Line '    /// Curve exponent, when the property moves non-linearly under its slider. A curved'
+Add-Line '    /// property set to half its range is not half its effect.'
+Add-Line '    pub curve: Option<f64>,'
 Add-Line '}'
 Add-Line ''
 Add-Line '/// Members of every enumeration a property can be typed by, in declaration order.'
@@ -464,7 +742,9 @@ function Format-Property($p) {
     $mnv = if ($null -ne $p.Min) { 'Some(' + $p.Min + '_f64)' } else { 'None' }
     $mxv = if ($null -ne $p.Max) { 'Some(' + $p.Max + '_f64)' } else { 'None' }
     $lbl = if ($p.Label) { 'Some("' + $p.Label + '")' } else { 'None' }
-    "NodeProperty { name: `"$($p.Name)`", cs_type: `"$($p.CsType)`", default_value: $dv, min: $mnv, max: $mxv, label: $lbl }"
+    $dt = if ($p.DefaultText) { 'Some("' + $p.DefaultText + '")' } else { 'None' }
+    $cv = if ($null -ne $p.Curve) { 'Some(' + $p.Curve + '_f64)' } else { 'None' }
+    "NodeProperty { name: `"$($p.Name)`", cs_type: `"$($p.CsType)`", default_value: $dv, min: $mnv, max: $mxv, label: $lbl, default_text: $dt, curve: $cv }"
 }
 
 Add-Line '/// Properties per node type.'

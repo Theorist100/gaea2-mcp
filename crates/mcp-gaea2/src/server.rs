@@ -1120,7 +1120,30 @@ impl Tool for RunProjectTool {
         };
         self.refs.execution_history.write().await.push(entry);
 
-        ToolResult::json(&result)
+        let mut reported = serde_json::to_value(&result).unwrap_or_else(|_| json!({}));
+
+        // A build that wrote nothing says nothing about why. Nodes marked [RequiresBaking] are
+        // one known way to get an empty result out of a graph that looks complete, so name the
+        // ones present rather than leaving the caller to guess.
+        if !result.success && result.file_count == 0 {
+            if let Ok(text) = tokio::fs::read_to_string(project_path).await {
+                let baking: Vec<&str> = crate::gaea_schema_generated::NODES_REQUIRING_BAKING
+                    .iter()
+                    .copied()
+                    .filter(|t| text.contains(&format!("QuadSpinner.Gaea.Nodes.{t}, Gaea.Nodes")))
+                    .collect();
+                if !baking.is_empty() {
+                    reported["nodes_requiring_baking"] = json!(baking);
+                    reported["baking_hint"] = json!(
+                        "These nodes are marked [RequiresBaking] in the installed build. Such a \
+                         node can finish without producing data, which shows up as a build that \
+                         writes no files and reports no error."
+                    );
+                }
+            }
+        }
+
+        ToolResult::json(&reported)
     }
 }
 
@@ -2005,9 +2028,32 @@ impl Tool for NodeInfoTool {
                         "min": p.min,
                         "max": p.max
                     });
+                    // Enumerated and boolean properties carry their default as a name.
+                    if let Some(text) = p.default_text {
+                        described["default"] = json!(text);
+                    }
+                    if let Some(curve) = p.curve {
+                        described["curve"] = json!(curve);
+                        described["curve_note"] = json!(
+                            "Non-linear: a value halfway along the range is not half the effect."
+                        );
+                    }
                     // Enumerated properties must be written by member name, so list them.
                     if !allowed.is_empty() {
                         described["values"] = json!(allowed);
+                    }
+                    // What the shipped scenes chose, which the declared range cannot tell you.
+                    if let Some(u) = crate::schema::find_property_usage(node_type, p.name) {
+                        let mut seen = json!({"times_set": u.times_set});
+                        if let (Some(low), Some(median), Some(high)) = (u.low, u.median, u.high) {
+                            seen["low"] = json!(low);
+                            seen["median"] = json!(median);
+                            seen["high"] = json!(high);
+                        }
+                        if let Some(common) = u.most_common {
+                            seen["most_common"] = json!(common);
+                        }
+                        described["in_shipped_scenes"] = seen;
                     }
                     described
                 })
@@ -2018,16 +2064,50 @@ impl Tool for NodeInfoTool {
                 .map(|(name, order)| json!({"type": name, "order": order}))
                 .collect();
 
-            json!({
+            // Where this node tends to sit in a graph, taken from the scenes Gaea ships.
+            let follows: Vec<Value> = crate::schema::common_predecessors(node_type)
+                .into_iter()
+                .take(5)
+                .map(|(from, from_port, to_port, count)| {
+                    json!({"node": from, "from_port": from_port, "into_port": to_port, "times": count})
+                })
+                .collect();
+            let feeds: Vec<Value> = crate::schema::common_successors(node_type)
+                .into_iter()
+                .take(5)
+                .map(|(from_port, to, to_port, count)| {
+                    json!({"node": to, "from_port": from_port, "into_port": to_port, "times": count})
+                })
+                .collect();
+
+            let mut described = json!({
                 "type": node_type,
                 "category": get_node_category(node_type),
+                "family": crate::schema::node_family(node_type),
+                "short_code": crate::schema::node_short_code(node_type),
                 "is_generator": is_generator_node(node_type),
                 "is_output": is_output_node(node_type),
                 "ports": ports,
                 "ports_verified": has_known_ports(node_type),
                 "intrinsic_modifiers": modifiers,
-                "properties": properties
-            })
+                "properties": properties,
+                "used_in_shipped_scenes": crate::schema::usage_count(node_type),
+                "usually_fed_by": follows,
+                "usually_feeds": feeds
+            });
+
+            let keywords = crate::schema::node_keywords(node_type);
+            if !keywords.is_empty() {
+                described["keywords"] = json!(keywords);
+            }
+            if crate::schema::requires_baking(node_type) {
+                described["requires_baking"] = json!(true);
+                described["baking_note"] = json!(
+                    "Marked [RequiresBaking]: built on its own this node can finish without \
+                     writing a file and without an error."
+                );
+            }
+            described
         }
 
         /// Describe one modifier: what it does with the node it sits on, and what it accepts.
@@ -2144,26 +2224,43 @@ impl Tool for NodeInfoTool {
             .iter()
             .copied()
             .filter(|t| {
-                let by_search = search
-                    .as_ref()
-                    .is_none_or(|s| t.to_lowercase().contains(s.as_str()));
+                // Searching names alone misses what Gaea's own tool box finds: Dusting answers
+                // to "snow", Glacier to "ice", MountainSide to "slopenoise".
+                let by_search = search.as_ref().is_none_or(|s| {
+                    t.to_lowercase().contains(s.as_str())
+                        || crate::schema::node_keywords(t)
+                            .iter()
+                            .any(|k| k.to_lowercase().contains(s.as_str()))
+                });
                 let by_category = category.is_none_or(|c| {
                     get_node_category(t).is_some_and(|actual| actual.eq_ignore_ascii_case(c))
                 });
                 by_search && by_category
             })
             .collect();
-        matches.sort_unstable();
+        // Most-used first: a node in forty scenes is the one a caller most likely wants.
+        matches.sort_unstable_by(|a, b| {
+            crate::schema::usage_count(b)
+                .cmp(&crate::schema::usage_count(a))
+                .then(a.cmp(b))
+        });
 
         let listed: Vec<Value> = matches
             .iter()
             .map(|t| {
-                json!({
+                let mut entry = json!({
                     "type": t,
                     "category": get_node_category(t),
+                    "family": crate::schema::node_family(t),
                     "is_generator": is_generator_node(t),
-                    "is_output": is_output_node(t)
-                })
+                    "is_output": is_output_node(t),
+                    "used_in_shipped_scenes": crate::schema::usage_count(t)
+                });
+                let keywords = crate::schema::node_keywords(t);
+                if !keywords.is_empty() {
+                    entry["keywords"] = json!(keywords);
+                }
+                entry
             })
             .collect();
 

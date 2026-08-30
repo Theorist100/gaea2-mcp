@@ -15,7 +15,7 @@ use std::sync::LazyLock;
 
 use crate::gaea_schema_generated as gen;
 
-pub use crate::gaea_schema_generated::{NodeProperty, GAEA_VERSION};
+pub use crate::gaea_schema_generated::{NodeProperty, PropertyUsage, GAEA_VERSION};
 
 /// Ports every node has unless the extracted table says otherwise.
 const FALLBACK_PORTS: &[(&str, &str)] = &[("In", "PrimaryIn"), ("Out", "PrimaryOut")];
@@ -109,6 +109,79 @@ pub fn find_property(node_type: &str, property: &str) -> Option<&'static NodePro
     get_node_properties(node_type)
         .iter()
         .find(|p| p.name == property)
+}
+
+/// The family a node belongs to, a second axis beside its tool box category.
+pub fn node_family(node_type: &str) -> Option<&'static str> {
+    gen::NODE_FAMILY
+        .iter()
+        .find(|(name, _)| *name == node_type)
+        .map(|(_, family)| *family)
+}
+
+/// The short code Gaea itself uses for a node.
+pub fn node_short_code(node_type: &str) -> Option<&'static str> {
+    gen::NODE_SHORT_CODES
+        .iter()
+        .find(|(name, _)| *name == node_type)
+        .map(|(_, code)| *code)
+}
+
+/// Search words a node answers to in the tool box, beyond its own name.
+pub fn node_keywords(node_type: &str) -> &'static [&'static str] {
+    gen::NODE_KEYWORDS
+        .iter()
+        .find(|(name, _)| *name == node_type)
+        .map(|(_, words)| *words)
+        .unwrap_or(&[])
+}
+
+/// Whether a node has to be baked before it produces anything.
+///
+/// Built alone, such a node can finish without writing a file and without an error.
+pub fn requires_baking(node_type: &str) -> bool {
+    gen::NODES_REQUIRING_BAKING.contains(&node_type)
+}
+
+/// How many times a node appears across the scenes Gaea ships.
+pub fn usage_count(node_type: &str) -> u32 {
+    gen::NODE_USAGE
+        .iter()
+        .find(|(name, _)| *name == node_type)
+        .map(|(_, count)| *count)
+        .unwrap_or(0)
+}
+
+/// How the shipped scenes set the properties of a node.
+pub fn property_usage(node_type: &str) -> &'static [PropertyUsage] {
+    gen::PROPERTY_USAGE
+        .iter()
+        .find(|(name, _)| *name == node_type)
+        .map(|(_, usage)| *usage)
+        .unwrap_or(&[])
+}
+
+/// How the shipped scenes set one property of a node.
+pub fn find_property_usage(node_type: &str, property: &str) -> Option<&'static PropertyUsage> {
+    property_usage(node_type).iter().find(|u| u.name == property)
+}
+
+/// What the shipped scenes usually connect downstream of a node, most frequent first.
+pub fn common_successors(node_type: &str) -> Vec<(&'static str, &'static str, &'static str, u32)> {
+    gen::COMMON_CONNECTIONS
+        .iter()
+        .filter(|(from, _, _, _, _)| *from == node_type)
+        .map(|(_, from_port, to, to_port, count)| (*from_port, *to, *to_port, *count))
+        .collect()
+}
+
+/// What the shipped scenes usually connect upstream of a node, most frequent first.
+pub fn common_predecessors(node_type: &str) -> Vec<(&'static str, &'static str, &'static str, u32)> {
+    gen::COMMON_CONNECTIONS
+        .iter()
+        .filter(|(_, _, to, _, _)| *to == node_type)
+        .map(|(from, from_port, _, to_port, count)| (*from, *from_port, *to_port, *count))
+        .collect()
 }
 
 /// Check if a modifier type exists in the installed build.
