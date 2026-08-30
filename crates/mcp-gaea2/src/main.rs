@@ -21,6 +21,7 @@ use anyhow::Result;
 use clap::Parser;
 use mcp_core::{init_logging, server::MCPServerArgs, MCPServer};
 
+mod calibration;
 mod cli;
 mod config;
 #[rustfmt::skip]

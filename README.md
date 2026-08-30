@@ -110,9 +110,9 @@ GAEA2_OUTPUT_DIR = 'C:\Users\you\Documents\Gaea\Builds'
 `validate_gaea2_runtime`.
 
 **Building** — `run_gaea2_project`, `analyze_gaea2_build`, `analyze_gaea2_terrain`,
-`analyze_execution_history`.
+`calibrate_gaea2_nodes`, `analyze_execution_history`.
 
-Four of these are worth calling out:
+Five of these are worth calling out:
 
 * `gaea2_node_info` answers "what is this node and what can I set on it" from the installed
   build: category and family, ports in serialization order, intrinsic modifiers, properties
@@ -126,9 +126,42 @@ Four of these are worth calling out:
   and describes the land rather than the file: relief in metres, how much of the playable
   middle is gentle enough to build on, whether the edges stand above that middle, the split
   into height classes, and a profile along each axis.
+* `calibrate_gaea2_nodes` measures what generators actually produce — see below.
 * `patch_gaea2_project` edits node properties in place, checking names against the installed
   build and values against their range, instead of regenerating a graph and losing whatever
   the caller did not restate.
+
+## Measuring what a node produces
+
+A parameter is not an outcome. `MountainRange` at its defaults fills 8.9% of the vertical
+range; `Cracks` fills 100%; `DuneSea` fills 0.8% and is invisible on a map next to anything
+else. None of that is in the metadata, and finding it out per node by hand costs a build and a
+measurement each time.
+
+`calibrate_gaea2_nodes` builds every generator at once — Gaea writes one file per saved node,
+so a point costs a single launch no matter how many nodes ride on it — measures each output,
+and writes the result to `gaea_calibration.json`. `gaea2_node_info` then reports it beside the
+schema. Measuring 26 generators at their defaults takes about half a minute at 512; a sweep of
+three points over a property takes about the same.
+
+```jsonc
+// one point at defaults, then three points across the declared range of Height
+{"seeds": [1001, 2002, 3003]}
+{"property": "Height", "steps": 3}
+```
+
+Each measurement records the share of the range filled, the mean level — which separates a
+field that fills the range from one lying flat with a single peak — and the spread across
+seeds. Runs fold together, so sweeping a second property keeps the first.
+
+A node that faults takes its whole build down, which would leave a batch of forty with nothing
+to show. Failed batches are halved and retried, so one bad node costs a few extra launches and
+ends up named in `skipped` rather than silently losing the run: `CutNoise` is the one that does
+not build alone here.
+
+Measurements belong to a machine and a Gaea version, not to the schema, which is why they live
+in a file next to the output directory rather than in the generated source. A calibration from
+an older Gaea is discarded rather than merged.
 
 ## Judging a build by what it did
 
@@ -162,9 +195,10 @@ node fed by `Thermal2` writes `Thermal2_Out.raw`. That is Gaea's behaviour, not 
 
 **A property's value is not always its effect.** 42 properties carry a curve exponent, and
 some scale with the size of what they make: a `Mountain` at `Scale 0.16` with `Height 0.42`
-came out at 3% of full height and was invisible on the map. `gaea2_node_info` reports the
-curve and what the shipped scenes chose, which is the fastest way to notice this before a
-build rather than after one.
+came out at 3% of full height and was invisible on the map. Measured across its range,
+`Mountain` fills 24% at `Height 1.5` and 37% at `Height 3.0` — the top of the range is not
+the top of the terrain. `gaea2_node_info` reports the curve, what the shipped scenes chose,
+and what was measured, which is how to notice this before a build rather than after one.
 
 ## Licence
 

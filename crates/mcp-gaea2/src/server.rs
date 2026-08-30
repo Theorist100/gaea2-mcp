@@ -78,11 +78,12 @@ impl Gaea2Server {
             Arc::new(AnalyzeExecutionHistoryTool { refs: refs.clone() }),
             Arc::new(RepairProjectTool { refs: refs.clone() }),
             Arc::new(ValidateRuntimeTool { refs: refs.clone() }),
-            Arc::new(NodeInfoTool),
+            Arc::new(NodeInfoTool { refs: refs.clone() }),
             Arc::new(AnalyzeBuildTool),
             Arc::new(AnalyzeTerrainTool),
             Arc::new(SetSaveDefinitionTool),
             Arc::new(PatchProjectTool),
+            Arc::new(CalibrateNodesTool { refs }),
         ]
     }
 }
@@ -1959,7 +1960,9 @@ impl Tool for ValidateRuntimeTool {
 
 /// Answers "what is this node and what can I set on it" straight from the installed build,
 /// so callers stop inferring ports and property names from example files.
-struct NodeInfoTool;
+struct NodeInfoTool {
+    refs: ServerRefs,
+}
 
 #[async_trait]
 impl Tool for NodeInfoTool {
@@ -2010,8 +2013,15 @@ impl Tool for NodeInfoTool {
             is_valid_node_type, GAEA_VERSION, VALID_NODE_TYPES,
         };
 
+        // Measurements, when this machine has taken any. They belong beside the schema rather
+        // than inside it: what a node produces is a fact about a build on a machine, not a
+        // declaration in an assembly.
+        let measured = crate::calibration::load(&crate::calibration::default_path(
+            &self.refs.config.output_dir,
+        ));
+
         /// Full description of one node type.
-        fn describe(node_type: &str) -> Value {
+        fn describe(node_type: &str, measured: Option<&crate::calibration::Calibration>) -> Value {
             let ports: Vec<Value> = get_default_ports(node_type)
                 .iter()
                 .map(|(name, kind)| json!({"name": name, "type": kind}))
@@ -2106,6 +2116,42 @@ impl Tool for NodeInfoTool {
                     "Marked [RequiresBaking]: built on its own this node can finish without \
                      writing a file and without an error."
                 );
+            }
+
+            // What the node was measured to produce, which is the only place a caller learns
+            // that a parameter and its effect are not the same thing.
+            if let Some(calibration) = measured {
+                let taken = calibration.for_node(node_type);
+                if !taken.is_empty() {
+                    let rows: Vec<Value> = taken
+                        .iter()
+                        .map(|m| {
+                            let mut row = json!({
+                                "fills_range": (m.amplitude * 10_000.0).round() / 100.0,
+                                "mean_level": (m.mean_level * 10_000.0).round() / 100.0,
+                                "seed_spread": [
+                                    (m.amplitude_low * 10_000.0).round() / 100.0,
+                                    (m.amplitude_high * 10_000.0).round() / 100.0
+                                ]
+                            });
+                            match (&m.property, m.value) {
+                                (Some(property), Some(value)) => {
+                                    row["at"] = json!(format!("{property} = {value}"));
+                                },
+                                _ => row["at"] = json!("defaults"),
+                            }
+                            row
+                        })
+                        .collect();
+                    described["measured"] = json!({
+                        "gaea_version": calibration.gaea_version,
+                        "resolution": calibration.resolution,
+                        "note": "Share of the full vertical range the output occupies, as built \
+                                 on this machine. A parameter is not an outcome: some nodes \
+                                 scale their height with their footprint.",
+                        "points": rows
+                    });
+                }
             }
             described
         }
@@ -2207,7 +2253,7 @@ impl Tool for NodeInfoTool {
                 return ToolResult::json(&result);
             }
 
-            let mut described = describe(node_type);
+            let mut described = describe(node_type, measured.as_ref());
             described["found"] = json!(true);
             described["gaea_version"] = json!(GAEA_VERSION);
             return ToolResult::json(&described);
@@ -2770,6 +2816,394 @@ impl Tool for PatchProjectTool {
             "applied": applied,
             "warnings": warnings,
             "rejected": rejected
+        }))
+    }
+}
+
+// =============================================================================
+// Tool: calibrate_gaea2_nodes
+// =============================================================================
+
+/// Measures what generators actually produce, because a parameter is not an outcome.
+///
+/// `Mountain` with `Height 0.42` at `Scale 0.16` fills 3% of the vertical range: the height
+/// scales with the footprint, and nothing in the metadata says so. Finding that out cost a
+/// build, a saved probe output and a separate measurement. This does the same for every
+/// generator at once, since Gaea writes one file per saved node and a single build can carry
+/// them all.
+struct CalibrateNodesTool {
+    refs: ServerRefs,
+}
+
+#[async_trait]
+impl Tool for CalibrateNodesTool {
+    fn name(&self) -> &str {
+        "calibrate_gaea2_nodes"
+    }
+
+    fn description(&self) -> &str {
+        "Build generator nodes and measure what they actually produce: the share of the vertical \
+         range each one fills, and how that changes across a property sweep and across seeds. \
+         Answers 'how tall does this come out', which no declared range can. Writes a \
+         calibration file that gaea2_node_info then reports alongside the schema."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "nodes": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Node types to measure. Defaults to every generator in the Primitive and Terrain categories."
+                },
+                "property": {
+                    "type": "string",
+                    "description": "Property to sweep, e.g. 'Height'. Omit to measure at defaults only."
+                },
+                "steps": {
+                    "type": "integer",
+                    "description": "Points in the sweep, spread across the declared range including both ends",
+                    "default": 3,
+                    "minimum": 2,
+                    "maximum": 9
+                },
+                "seeds": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "Seeds to build each point with; the spread across them says how much the seed alone moves the result",
+                    "default": [1001, 2002, 3003]
+                },
+                "resolution": {
+                    "type": "integer",
+                    "description": "Build resolution. 512 is enough: amplitude is a property of the shape, not of the sampling.",
+                    "default": 512
+                },
+                "output_path": {
+                    "type": "string",
+                    "description": "Where to write the calibration. Defaults to gaea_calibration.json in the output directory."
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Seconds to allow per build",
+                    "default": 1800
+                }
+            }
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<ToolResult> {
+        use crate::calibration::{
+            self, default_path, measurable_nodes, measure, median, sweep_values, Calibration,
+            Measurement,
+        };
+
+        let Some(cli) = self.refs.cli.as_ref() else {
+            return Err(MCPError::InvalidParameters(
+                "Gaea is not configured; set GAEA2_PATH to measure anything".to_string(),
+            ));
+        };
+
+        let nodes: Vec<String> = match args.get("nodes").and_then(|v| v.as_array()) {
+            Some(list) => list
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect(),
+            None => measurable_nodes().into_iter().map(str::to_string).collect(),
+        };
+        if nodes.is_empty() {
+            return Err(MCPError::InvalidParameters(
+                "No nodes to measure".to_string(),
+            ));
+        }
+        for node in &nodes {
+            if !crate::schema::is_valid_node_type(node) {
+                return Err(MCPError::InvalidParameters(format!(
+                    "'{node}' is not a node type in Gaea {}",
+                    crate::schema::GAEA_VERSION
+                )));
+            }
+        }
+
+        let property = args
+            .get("property")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let steps = args
+            .get("steps")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(3)
+            .clamp(2, 9) as usize;
+        let seeds: Vec<i64> = match args.get("seeds").and_then(|v| v.as_array()) {
+            Some(list) => list.iter().filter_map(|v| v.as_i64()).collect(),
+            None => vec![1001, 2002, 3003],
+        };
+        if seeds.is_empty() {
+            return Err(MCPError::InvalidParameters(
+                "At least one seed is needed".to_string(),
+            ));
+        }
+        let resolution = args
+            .get("resolution")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(512) as u32;
+        if !crate::schema::is_valid_build_resolution(resolution) {
+            return Err(MCPError::InvalidParameters(format!(
+                "{resolution} is not a build resolution Gaea accepts; use a power of two from \
+                 256 to 8192"
+            )));
+        }
+        let timeout = args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(1800);
+
+        // One build per sweep point, carrying every node at every seed. Gaea writes a file per
+        // saved node, so a point costs one launch regardless of how many nodes ride on it -
+        // which is what makes measuring forty generators affordable at all.
+        //
+        // A point is a fraction of each node's own declared range, not an absolute value:
+        // Height runs to 3 on one node and to 1 on another, and pooling absolute values would
+        // turn three points into one build per distinct number across forty nodes.
+        let points: Vec<Option<f64>> = match property.as_deref() {
+            None => vec![None],
+            Some(prop) => {
+                let usable = nodes
+                    .iter()
+                    .any(|node| !sweep_values(node, prop, steps).is_empty());
+                if !usable {
+                    return Err(MCPError::InvalidParameters(format!(
+                        "None of the given nodes declare a numeric range for '{prop}'"
+                    )));
+                }
+                (0..steps)
+                    .map(|i| Some(i as f64 / (steps - 1).max(1) as f64))
+                    .collect()
+            },
+        };
+
+        let work_dir = self.refs.config.output_dir.join("calibration");
+        tokio::fs::create_dir_all(&work_dir)
+            .await
+            .map_err(|e| MCPError::ToolExecutionFailed(format!("Cannot create work directory: {e}")))?;
+
+        let mut measurements: Vec<Measurement> = Vec::new();
+        let mut skipped: Vec<Value> = Vec::new();
+
+        // A single node that faults takes the whole build down with it, and a batch of forty
+        // then yields nothing. Failed batches are halved and retried, so one bad node costs a
+        // few extra builds instead of the entire run - and ends up named rather than hidden.
+        let mut batches: Vec<(usize, Vec<String>)> = points
+            .iter()
+            .enumerate()
+            .map(|(index, _)| (index, nodes.clone()))
+            .collect();
+        let mut attempt = 0usize;
+
+        while let Some((point_index, batch)) = batches.pop() {
+            let point = &points[point_index];
+            attempt += 1;
+            let mut planned: Vec<(String, String)> = Vec::new();
+            let mut workflow_nodes: Vec<Value> = Vec::new();
+            let mut next_id = 10;
+
+            // Absolute value each node takes at this point, kept for the record: 0.5 of Height
+            // means 1.5 on one node and 0.5 on another, and the measurement is worthless
+            // without saying which.
+            let mut actual_value: std::collections::HashMap<String, f64> =
+                std::collections::HashMap::new();
+
+            for node_type in &batch {
+                let mut properties = serde_json::Map::new();
+                if let Some(fraction) = point {
+                    let Some(prop) = property.as_deref() else {
+                        continue;
+                    };
+                    // A node that does not declare this property with a range sits this out
+                    // rather than being forced to a value it rejects.
+                    let declared = crate::schema::find_property(node_type, prop);
+                    let Some((min, max)) = declared.and_then(|d| Some((d.min?, d.max?))) else {
+                        continue;
+                    };
+                    let value = ((min + (max - min) * fraction) * 10_000.0).round() / 10_000.0;
+                    actual_value.insert(node_type.clone(), value);
+                    properties.insert(prop.to_string(), json!(value));
+                }
+
+                for seed in &seeds {
+                    if crate::schema::is_generator_node(node_type) {
+                        properties.insert("Seed".to_string(), json!(seed));
+                    }
+                    // Gaea names an output after the node that fed it, so the node name is how a
+                    // file finds its way back to what produced it.
+                    let stem = format!("cal_{node_type}_{seed}");
+                    workflow_nodes.push(json!({
+                        "id": next_id,
+                        "type": node_type,
+                        "name": stem,
+                        "properties": Value::Object(properties.clone()),
+                        "save_definition": {"filename": stem, "format": "UshortRaw16"}
+                    }));
+                    planned.push((stem, node_type.clone()));
+                    next_id += 10;
+                }
+            }
+
+            if planned.is_empty() {
+                continue;
+            }
+
+            let label = match point {
+                Some(v) => format!("{v}"),
+                None => "defaults".to_string(),
+            };
+            // Each attempt gets its own directory: a retried half must not measure the files a
+            // failed batch happened to write before it faulted.
+            let build_dir = work_dir.join(format!("point_{}_{attempt}", label.replace('.', "_")));
+            // A file left by an earlier run would be measured as if it were fresh.
+            let _ = tokio::fs::remove_dir_all(&build_dir).await;
+
+            let parsed = parse_nodes(&workflow_nodes)
+                .map_err(|e| MCPError::ToolExecutionFailed(format!("Cannot build the probe: {e}")))?;
+            let workflow = Workflow {
+                nodes: parsed,
+                connections: Vec::new(),
+            };
+            let build_config = BuildConfig {
+                resolution: resolution as i32,
+                ..Default::default()
+            };
+            let project_file = work_dir.join(format!("calibration_{label}.terrain"));
+            let project_path = project_file.to_string_lossy().to_string();
+            generate_project(
+                &format!("Calibration_{label}"),
+                &workflow,
+                Some(build_config),
+                Some(&project_path),
+            )
+            .await
+            .map_err(MCPError::ToolExecutionFailed)?;
+
+            let result = cli
+                .run_project(
+                    &project_path,
+                    &resolution.to_string(),
+                    Some(&build_dir.to_string_lossy()),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    true,
+                    false,
+                    timeout,
+                )
+                .await;
+
+            if !result.success && result.file_count == 0 {
+                let reason = result
+                    .error
+                    .unwrap_or_else(|| "the build wrote nothing".to_string());
+                if batch.len() > 1 {
+                    // Halve and retry: whichever half holds the offender fails again, and the
+                    // other half is measured normally.
+                    let half = batch.len() / 2;
+                    batches.push((point_index, batch[half..].to_vec()));
+                    batches.push((point_index, batch[..half].to_vec()));
+                } else {
+                    skipped.push(json!({
+                        "node": batch[0],
+                        "point": label,
+                        "reason": reason
+                    }));
+                }
+                continue;
+            }
+
+            let mut per_node: std::collections::HashMap<String, Vec<(f64, f64)>> =
+                std::collections::HashMap::new();
+            for (stem, node_type) in &planned {
+                let file = build_dir.join(format!("{stem}_Out.r16"));
+                match measure(&file) {
+                    Ok(pair) => per_node.entry(node_type.clone()).or_default().push(pair),
+                    Err(_) => {
+                        skipped.push(json!({
+                            "node": node_type,
+                            "point": label,
+                            "reason": "the build produced no file for this node"
+                        }));
+                    },
+                }
+            }
+
+            for (node_type, pairs) in per_node {
+                let mut amplitudes: Vec<f64> = pairs.iter().map(|(a, _)| *a).collect();
+                let mut levels: Vec<f64> = pairs.iter().map(|(_, l)| *l).collect();
+                let low = amplitudes.iter().copied().fold(f64::MAX, f64::min);
+                let high = amplitudes.iter().copied().fold(f64::MIN, f64::max);
+                let value = actual_value.get(&node_type).copied();
+                measurements.push(Measurement {
+                    property: point.and(property.clone()),
+                    value,
+                    node_type,
+                    seeds: seeds.clone(),
+                    amplitude: median(&mut amplitudes),
+                    amplitude_low: low,
+                    amplitude_high: high,
+                    mean_level: median(&mut levels),
+                });
+            }
+        }
+
+        if measurements.is_empty() {
+            return Err(MCPError::ToolExecutionFailed(format!(
+                "Nothing was measured. {}",
+                serde_json::to_string(&skipped).unwrap_or_default()
+            )));
+        }
+
+        let fresh = Calibration {
+            gaea_version: crate::schema::GAEA_VERSION.to_string(),
+            measured_at: Utc::now().to_rfc3339(),
+            resolution,
+            measurements,
+        };
+
+        let out = args
+            .get("output_path")
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| default_path(&self.refs.config.output_dir));
+        // A run covers one property; folding into what is there keeps earlier sweeps.
+        let taken = fresh.measurements.len();
+        let calibration = calibration::merge(calibration::load(&out), fresh);
+        calibration::save(&out, &calibration).map_err(MCPError::ToolExecutionFailed)?;
+
+        // Report the outliers rather than the whole table: the useful thing to see first is
+        // which nodes do not do what their parameters suggest.
+        let mut quiet: Vec<Value> = calibration
+            .measurements
+            .iter()
+            .filter(|m| m.amplitude < 0.2)
+            .map(|m| {
+                json!({
+                    "node": m.node_type,
+                    "value": m.value,
+                    "fills": format!("{:.1}%", m.amplitude * 100.0)
+                })
+            })
+            .collect();
+        quiet.truncate(15);
+
+        ToolResult::json(&json!({
+            "success": true,
+            "calibration_path": out.to_string_lossy(),
+            "gaea_version": calibration.gaea_version,
+            "resolution": resolution,
+            "nodes_measured": calibration::by_node(&calibration.measurements).len(),
+            "measurements_taken": taken,
+            "measurements_on_file": calibration.measurements.len(),
+            "sweep": property,
+            "points": points.len(),
+            "fills_under_a_fifth_of_the_range": quiet,
+            "skipped": skipped
         }))
     }
 }
