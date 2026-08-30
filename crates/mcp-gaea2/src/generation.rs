@@ -201,6 +201,9 @@ fn create_node_object(node: &Node, mut ref_id_counter: u32) -> Result<(Value, u3
 
     // Node-specific properties
     for (key, value) in &node.properties {
+        // An enumerated property written as a number stops the whole build, silently.
+        crate::schema::check_property_value(&node.node_type, key, value)
+            .map_err(|e| format!("Node {}: {e}", node.id))?;
         node_obj.insert(key.clone(), value.clone());
     }
 

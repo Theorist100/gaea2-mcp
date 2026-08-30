@@ -121,7 +121,25 @@ if (-not (Test-Path $decompFile)) {
 $lines = [System.IO.File]::ReadAllLines($decompFile)
 $catOf = @{}
 $propsOf = @{}
+$enumValues = @{}
 $seedNodes = New-Object System.Collections.Generic.List[string]
+
+# Enumerations first: a property typed by one of these must be written as the member NAME.
+# Writing the ordinal instead makes Gaea fail to load the node, and the build then exits with
+# code 1 having produced nothing and no crash log (Rivers.RiverValleyWidth = 0 did exactly that).
+for ($i = 0; $i -lt $lines.Count; $i++) {
+    if ($lines[$i] -notmatch '^\s*(?:public|internal)\s+enum\s+([A-Za-z0-9_]+)') { continue }
+    $enumName = $Matches[1]
+    $members = New-Object System.Collections.Generic.List[string]
+    for ($j = $i + 1; $j -lt [Math]::Min($i + 200, $lines.Count); $j++) {
+        $line = $lines[$j].Trim()
+        if ($line -eq '}') { break }
+        if ($line -match '^\[' -or $line -eq '{' -or $line -eq '') { continue }
+        if ($line -match '^([A-Za-z_][A-Za-z0-9_]*)\s*(=.*)?,?$') { $members.Add($Matches[1]) }
+    }
+    if ($members.Count -gt 0) { $enumValues[$enumName] = $members }
+}
+Write-Host "Enumerations: $($enumValues.Count)"
 
 $currentClass = $null
 $pendingCat = $null
@@ -360,6 +378,19 @@ Add-Line '    /// Upper bound, when known.'
 Add-Line '    pub max: Option<f64>,'
 Add-Line '}'
 Add-Line ''
+Add-Line '/// Members of every enumeration a property can be typed by, in declaration order.'
+Add-Line '///'
+Add-Line '/// A property of an enumerated type has to be written as the member name. Writing the'
+Add-Line '/// ordinal makes Gaea fail to load the node: the build exits 1 with no files and no crash'
+Add-Line '/// log, which looks like a broken graph rather than a bad value.'
+Add-Line 'pub static ENUM_VALUES: &[(&str, &[&str])] = &['
+foreach ($k in ($enumValues.Keys | Sort-Object)) {
+    $items = ($enumValues[$k] | ForEach-Object { "`"$_`"" }) -join ', '
+    Add-Line "    (`"$k`", &[$items]),"
+}
+Add-Line '];'
+Add-Line ''
+
 Add-Line '/// Properties per node type.'
 Add-Line 'pub static NODE_PROPERTIES: &[(&str, &[NodeProperty])] = &['
 foreach ($k in ($propsOf.Keys | Sort-Object)) {

@@ -1749,6 +1749,14 @@ fn report_property_ranges(node: &Value, id: &str, node_type: &str, warnings: &mu
         if name.starts_with('$') {
             continue;
         }
+
+        // An enumerated property stored as a number stops the build dead, with no diagnostics
+        // of any kind, so it is worth naming even though repair cannot guess the right member.
+        if let Err(problem) = crate::schema::check_property_value(node_type, name, value) {
+            warnings.push(format!("Node {id}: {problem}"));
+            continue;
+        }
+
         let Some(declared) = crate::schema::find_property(node_type, name) else {
             continue;
         };
@@ -1909,13 +1917,19 @@ impl Tool for NodeInfoTool {
             let properties: Vec<Value> = get_node_properties(node_type)
                 .iter()
                 .map(|p| {
-                    json!({
+                    let allowed = crate::schema::enum_values(p.cs_type);
+                    let mut described = json!({
                         "name": p.name,
                         "type": p.cs_type,
                         "default": p.default_value,
                         "min": p.min,
                         "max": p.max
-                    })
+                    });
+                    // Enumerated properties must be written by member name, so list them.
+                    if !allowed.is_empty() {
+                        described["values"] = json!(allowed);
+                    }
+                    described
                 })
                 .collect();
 
@@ -2319,6 +2333,15 @@ impl Tool for PatchProjectTool {
                 };
 
                 for (name, value) in properties {
+                    // An enumerated property written as a number makes Gaea fail to load the
+                    // node, and the build then produces nothing at all.
+                    if let Err(problem) =
+                        crate::schema::check_property_value(&node_type, name, value)
+                    {
+                        rejected.push(format!("Node {node_id}: {problem}"));
+                        continue;
+                    }
+
                     match find_property(&node_type, name) {
                         Some(declared) => {
                             if let (Some(actual), Some(min), Some(max)) =

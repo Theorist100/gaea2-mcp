@@ -111,6 +111,51 @@ pub fn find_property(node_type: &str, property: &str) -> Option<&'static NodePro
         .find(|p| p.name == property)
 }
 
+/// Members of an enumerated property type, empty when the type is not an enumeration.
+pub fn enum_values(type_name: &str) -> &'static [&'static str] {
+    gen::ENUM_VALUES
+        .iter()
+        .find(|(name, _)| *name == type_name)
+        .map(|(_, values)| *values)
+        .unwrap_or(&[])
+}
+
+/// Check a value about to be written for one property of a node.
+///
+/// Only enumerated properties are rejected outright, and for a reason worth the strictness:
+/// Gaea stores them by member name, and an ordinal makes it fail to load the node. The build
+/// then exits with code 1, no files and no crash log - indistinguishable from a broken graph.
+/// `Rivers.RiverValleyWidth = 0` cost exactly that investigation; `"minus4"` builds fine.
+pub fn check_property_value(
+    node_type: &str,
+    property: &str,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    let Some(declared) = find_property(node_type, property) else {
+        return Ok(());
+    };
+    let allowed = enum_values(declared.cs_type);
+    if allowed.is_empty() {
+        return Ok(());
+    }
+
+    match value.as_str() {
+        Some(text) if allowed.contains(&text) => Ok(()),
+        Some(text) => Err(format!(
+            "'{property}' of {node_type} is a {} and has no member '{text}'. Expected one of: {}",
+            declared.cs_type,
+            allowed.join(", ")
+        )),
+        None => Err(format!(
+            "'{property}' of {node_type} is a {} and must be written as a member name, not as \
+             {value}. Gaea would fail to load the node and the build would produce nothing. \
+             Expected one of: {}",
+            declared.cs_type,
+            allowed.join(", ")
+        )),
+    }
+}
+
 /// Build resolutions Gaea computes at: powers of two from 256 to 8192.
 ///
 /// Off-list values are not rejected by Gaea's command line - it starts the build, works through
@@ -293,6 +338,33 @@ mod tests {
         // Export-class nodes were previously stripped of "Out", which Gaea does emit.
         let ports = get_default_ports("Unity");
         assert!(ports.iter().any(|(n, _)| *n == "Out"));
+    }
+
+    #[test]
+    fn enumerated_properties_must_be_written_by_name() {
+        use serde_json::json;
+
+        // The value that silently killed a build: an ordinal where a member name belongs.
+        let err = check_property_value("Rivers", "RiverValleyWidth", &json!(0))
+            .expect_err("an ordinal is not a member name");
+        assert!(err.contains("minus4"), "should list the members: {err}");
+
+        assert!(check_property_value("Rivers", "RiverValleyWidth", &json!("minus4")).is_ok());
+        assert!(check_property_value("Rivers", "RiverValleyWidth", &json!("nonsense")).is_err());
+        assert!(check_property_value("Mountain", "Style", &json!("Alpine")).is_ok());
+
+        // Plain numeric and unknown properties are left alone here.
+        assert!(check_property_value("Rivers", "Water", &json!(0.5)).is_ok());
+        assert!(check_property_value("Rivers", "NoSuchProperty", &json!(1)).is_ok());
+    }
+
+    #[test]
+    fn enum_members_come_from_the_installed_build() {
+        assert_eq!(
+            enum_values("RiverValleyWidths"),
+            &["minus4", "minus2", "zero", "plus2", "plus4"]
+        );
+        assert!(enum_values("float").is_empty());
     }
 
     #[test]

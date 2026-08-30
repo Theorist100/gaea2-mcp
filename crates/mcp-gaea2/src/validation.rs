@@ -47,6 +47,15 @@ impl Validator {
 
             // Property ranges, where the installed build declares them.
             for (name, value) in &node.properties {
+                // An enumerated property written as a number makes Gaea fail to load the node,
+                // and the build then writes nothing without reporting anything.
+                if let Err(problem) =
+                    crate::schema::check_property_value(&node.node_type, name, value)
+                {
+                    errors.push(format!("Node {}: {problem}", node.id));
+                    continue;
+                }
+
                 let Some(declared) = find_property(&node.node_type, name) else {
                     continue;
                 };
