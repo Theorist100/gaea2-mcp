@@ -345,9 +345,9 @@ impl Gaea2CLI {
         // build look as if --node, --ignorecache and --verbose had been dropped on the way.
         tracing::info!("Running Gaea2: {:?} {}", self.gaea_path, args.join(" "));
 
-        // What was already there, so "did this build write anything" can be answered by
-        // difference rather than by an exit code that does not survive the launch.
-        let files_before = find_output_files(&output_dir).await;
+        // What was already there and when it was written, so a rebuild into the same directory
+        // is recognised as having produced something even though the names do not change.
+        let before = output_stamps(&output_dir).await;
 
         let start_time = Instant::now();
 
@@ -361,8 +361,12 @@ impl Gaea2CLI {
                 let crash_text = crash.as_ref().map(|(text, _)| text.clone());
                 let first_fault = crash.as_ref().and_then(|(_, fault)| fault.clone());
 
-                let output_files = find_output_files(&output_dir).await;
-                let wrote_something = output_files.iter().any(|f| !files_before.contains(f));
+                let after = output_stamps(&output_dir).await;
+                let wrote_something = after
+                    .iter()
+                    .any(|(path, written)| before.get(path) != Some(written));
+                let mut output_files: Vec<String> = after.into_keys().collect();
+                output_files.sort();
 
                 // Gaea can exit zero and still leave a crash log for a node that faulted, and it
                 // can exit zero having computed nothing at all, so the exit code alone never
@@ -466,24 +470,39 @@ impl Gaea2CLI {
 
 /// Find output files in a directory.
 async fn find_output_files(dir: &Path) -> Vec<String> {
-    let mut files = Vec::new();
+    let mut files: Vec<String> = output_stamps(dir).await.into_keys().collect();
+    files.sort();
+    files
+}
 
-    let extensions = ["exr", "png", "tiff", "tif", "raw", "r16", "r32"];
+/// Output files with the moment each was last written.
+///
+/// Names alone cannot answer "did this build write anything": a rebuild into the same directory
+/// overwrites the same names, so comparing name lists reports a successful build as having
+/// produced nothing.
+async fn output_stamps(dir: &Path) -> std::collections::HashMap<String, std::time::SystemTime> {
+    const EXTENSIONS: [&str; 7] = ["exr", "png", "tiff", "tif", "raw", "r16", "r32"];
+    let mut stamps = std::collections::HashMap::new();
 
     if let Ok(mut entries) = tokio::fs::read_dir(dir).await {
         while let Ok(Some(entry)) = entries.next_entry().await {
             let path = entry.path();
-            if let Some(ext) = path.extension() {
-                let ext_lower = ext.to_string_lossy().to_lowercase();
-                if extensions.contains(&ext_lower.as_str()) {
-                    files.push(path.to_string_lossy().to_string());
-                }
+            let Some(ext) = path.extension() else {
+                continue;
+            };
+            if !EXTENSIONS.contains(&ext.to_string_lossy().to_lowercase().as_str()) {
+                continue;
             }
+            let written = entry
+                .metadata()
+                .await
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            stamps.insert(path.to_string_lossy().to_string(), written);
         }
     }
 
-    files.sort();
-    files
+    stamps
 }
 
 #[cfg(test)]
