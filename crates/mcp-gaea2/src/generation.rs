@@ -663,6 +663,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn always_writes_the_build_type() {
+        // Without BuildDefinition.Type Gaea exits 0 and writes nothing at all.
+        let workflow = Workflow {
+            nodes: vec![Node {
+                id: 1,
+                node_type: "Mountain".to_string(),
+                name: "Mountain".to_string(),
+                position: Position::default(),
+                properties: HashMap::new(),
+                ports: None,
+                modifiers: None,
+                save_definition: None,
+            }],
+            connections: vec![],
+        };
+
+        let project = generate_project("build_type", &workflow, None, None)
+            .await
+            .expect("Mountain is a valid type");
+        let build = &project["Assets"]["$values"][0]["BuildDefinition"];
+        assert_eq!(build["Type"], "Standard");
+        assert!(build["Destination"].is_string());
+    }
+
+    #[tokio::test]
     async fn keeps_the_placement_the_caller_asked_for() {
         // X and Y place the node on the map. Two shapes aimed at opposite edges must not both
         // end up in the centre.

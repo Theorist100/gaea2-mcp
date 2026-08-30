@@ -97,6 +97,78 @@ fn terrain_nodes_mut(project: &mut Value) -> Option<&mut serde_json::Map<String,
         .as_object_mut()
 }
 
+/// Locate the asset object that holds Terrain and BuildDefinition.
+fn terrain_asset_mut(project: &mut Value) -> Option<&mut serde_json::Map<String, Value>> {
+    project
+        .get_mut("Assets")?
+        .get_mut("$values")?
+        .get_mut(0)?
+        .as_object_mut()
+}
+
+/// Whether any node in the project writes a file.
+fn has_enabled_save(project: &Value) -> bool {
+    fn walk(value: &Value) -> bool {
+        match value {
+            Value::Object(map) => {
+                if let Some(save) = map.get("SaveDefinition") {
+                    if save
+                        .get("IsEnabled")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                    {
+                        return true;
+                    }
+                }
+                map.values().any(walk)
+            },
+            Value::Array(items) => items.iter().any(walk),
+            _ => false,
+        }
+    }
+    walk(project)
+}
+
+/// Make sure the project carries the build settings Gaea needs, reporting what was added.
+///
+/// `BuildDefinition.Type` is the one that decides whether a build happens at all. Without it
+/// Gaea.Swarm loads the project, exits with code 0 and writes nothing - no files, no crash log -
+/// which reads as an empty graph rather than a missing field. The scenes Gaea ships as examples
+/// have no `Type`, so enabling an output on a copy of one and building it produces exactly that
+/// silence. Verified by adding the fields one at a time: `Type` alone is enough, `Destination`
+/// and `ColorSpace` alone change nothing.
+fn ensure_buildable(project: &mut Value) -> Vec<String> {
+    let mut fixes = Vec::new();
+    let Some(asset) = terrain_asset_mut(project) else {
+        return fixes;
+    };
+
+    let build = asset
+        .entry("BuildDefinition".to_string())
+        .or_insert_with(|| json!({}));
+    let Some(build) = build.as_object_mut() else {
+        return fixes;
+    };
+
+    if !build.contains_key("Type") {
+        build.insert("Type".to_string(), json!("Standard"));
+        fixes.push(
+            "BuildDefinition.Type was missing and set to 'Standard'; without it Gaea builds \
+             nothing and reports no error"
+                .to_string(),
+        );
+    }
+    if !build.contains_key("Destination") {
+        build.insert(
+            "Destination".to_string(),
+            json!("<Builds>\\[Filename]\\[+++]"),
+        );
+        fixes.push("BuildDefinition.Destination was missing and set to the default".to_string());
+    }
+
+    fixes
+}
+
 /// The node type of a serialized node, taken from its `$type`.
 fn node_type_of(node: &Value) -> Option<&str> {
     node.get("$type")?
@@ -973,6 +1045,38 @@ impl Tool for RunProjectTool {
         let seed = args.get("seed").and_then(|v| v.as_i64());
         let region = args.get("region").and_then(|v| v.as_str());
         let target_node = args.get("target_node").and_then(|v| v.as_str());
+
+        // A build that cannot write anything still exits 0 and leaves no crash log, so say so
+        // here rather than reporting success over an empty directory.
+        if let Ok(text) = tokio::fs::read_to_string(project_path).await {
+            if let Ok(project) = serde_json::from_str::<Value>(&text) {
+                let has_type = project
+                    .get("Assets")
+                    .and_then(|a| a.get("$values"))
+                    .and_then(|v| v.get(0))
+                    .and_then(|a| a.get("BuildDefinition"))
+                    .and_then(|b| b.get("Type"))
+                    .is_some();
+
+                if !has_type {
+                    return Err(MCPError::InvalidParameters(
+                        "This project has no BuildDefinition.Type, and Gaea will exit cleanly \
+                         without writing a single file or a crash log. Scenes shipped as Gaea \
+                         examples are missing it. Run repair_gaea2_project on the file first."
+                            .to_string(),
+                    ));
+                }
+
+                if target_node.is_none() && !has_enabled_save(&project) {
+                    return Err(MCPError::InvalidParameters(
+                        "No node in this project has an enabled SaveDefinition, so the build \
+                         would produce no files. Use set_gaea2_save_definition to pick an \
+                         output, or pass target_node to build one node."
+                            .to_string(),
+                    ));
+                }
+            }
+        }
         let variables = args
             .get("variables")
             .and_then(|v| v.as_object())
@@ -1404,6 +1508,16 @@ impl Tool for RepairProjectTool {
                 repair_intrinsic_modifiers(node, &id, &node_type, &mut next_id, &mut repairs);
                 report_property_ranges(node, &id, &node_type, &mut warnings);
             }
+        }
+
+        repairs.extend(ensure_buildable(&mut project));
+
+        if !has_enabled_save(&project) {
+            warnings.push(
+                "No node in this project has an enabled SaveDefinition, so a build would write \
+                 nothing. Use set_gaea2_save_definition to pick an output."
+                    .to_string(),
+            );
         }
 
         // Rewriting an unchanged file only moves its checksum, which then reads as a repair
@@ -2084,6 +2198,9 @@ impl Tool for SetSaveDefinitionTool {
             .ok_or_else(|| MCPError::Internal(format!("Node {node_id} is not an object")))?
             .insert("SaveDefinition".to_string(), save.clone());
 
+        // An output is only half of what a build needs; see ensure_buildable.
+        let build_fixes = ensure_buildable(&mut project);
+
         save_project(&path, &project).await?;
 
         ToolResult::json(&json!({
@@ -2093,7 +2210,8 @@ impl Tool for SetSaveDefinitionTool {
             "node_id": node_id,
             "node_type": node_type,
             "created": existing.is_none(),
-            "save_definition": save
+            "save_definition": save,
+            "build_settings_fixed": build_fixes
         }))
     }
 }
