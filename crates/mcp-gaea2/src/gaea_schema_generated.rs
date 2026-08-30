@@ -255,6 +255,29 @@ pub static NODE_CATEGORIES: &[(&str, &[&str])] = &[
     ("Utility", UTILITY_NODES),
 ];
 
+/// Modifier types a node can carry (19).
+pub static MODIFIER_TYPES: &[&str] = &[
+    "Autolevel",
+    "Blur",
+    "Clamp",
+    "Clip",
+    "Difference",
+    "Drop",
+    "Equalize",
+    "Height",
+    "Influence",
+    "Invert",
+    "MatchHeight",
+    "Max",
+    "Min",
+    "Multiplier",
+    "Shaper",
+    "Slope",
+    "Strong",
+    "Threshold",
+    "Warp",
+];
+
 /// Nodes exposing a Seed property (76).
 pub static SEEDED_NODES: &[&str] = &[
     "Bomber",
@@ -377,7 +400,7 @@ pub static NODE_PORTS: &[(&str, &[(&str, &str)])] = &[
     ("FractalTerraces", &[("In", "PrimaryIn"), ("Out", "PrimaryOut"), ("Layers", "Out"), ("Modulation", "In")]),
     ("Gabor", &[("In", "PrimaryIn"), ("Out", "PrimaryOut"), ("Modulation", "In")]),
     ("Glacier", &[("In", "PrimaryIn"), ("Out", "PrimaryOut"), ("Reference", "In"), ("Snow", "Out")]),
-    ("GraphicEQ", &[("In", "PrimaryIn"), ("Out", "PrimaryOut"), ("Mask", "In")]),
+    ("GraphicEQ", &[("In", "PrimaryIn"), ("Out", "PrimaryOut")]),
     ("GroundTexture", &[("In", "PrimaryIn"), ("Out", "PrimaryOut")]),
     ("Height", &[("In", "PrimaryIn"), ("Out", "PrimaryOut")]),
     ("HSL", &[("In", "PrimaryIn"), ("Out", "PrimaryOut")]),

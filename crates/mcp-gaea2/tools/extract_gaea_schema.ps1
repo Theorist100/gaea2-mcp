@@ -104,6 +104,16 @@ foreach ($full in ($baseOf.Keys | Sort-Object)) {
 }
 Write-Host "Node classes: $($nodeNames.Count)"
 
+# Modifiers attach to a node and are serialized with their own $type, so an invented name
+# breaks the file the same way an invented node type does.
+$modifierNames = New-Object System.Collections.Generic.List[string]
+foreach ($full in ($baseOf.Keys | Sort-Object)) {
+    if ($nsOf[$full] -ne 'QuadSpinner.Gaea.Nodes.Modifiers') { continue }
+    if ($abstractOf[$full]) { continue }
+    $modifierNames.Add(($full -split '\.')[-1])
+}
+Write-Host "Modifier classes: $($modifierNames.Count)"
+
 $isNode = @{}
 foreach ($n in $nodeNames) { $isNode[$n] = $true }
 
@@ -326,6 +336,12 @@ Add-Line 'pub static NODE_CATEGORIES: &[(&str, &[&str])] = &['
 foreach ($c in ($byCat.Keys | Sort-Object)) {
     Add-Line "    (`"$c`", $($c.ToUpperInvariant())_NODES),"
 }
+Add-Line '];'
+Add-Line ''
+
+Add-Line "/// Modifier types a node can carry ($($modifierNames.Count))."
+Add-Line 'pub static MODIFIER_TYPES: &[&str] = &['
+foreach ($n in ($modifierNames | Sort-Object)) { Add-Line "    `"$n`"," }
 Add-Line '];'
 Add-Line ''
 

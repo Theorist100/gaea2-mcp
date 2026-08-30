@@ -281,6 +281,17 @@ fn create_node_object(node: &Node, mut ref_id_counter: u32) -> Result<(Value, u3
         Some(modifiers) => modifiers
             .iter()
             .map(|m| {
+                if !crate::schema::is_valid_modifier_type(&m.modifier_type) {
+                    return Err(format!(
+                        "Node {} has modifier '{}', which does not exist in Gaea {}. Available: \
+                         {}",
+                        node.id,
+                        m.modifier_type,
+                        crate::schema::GAEA_VERSION,
+                        crate::schema::modifier_types().join(", ")
+                    ));
+                }
+
                 let mut mod_obj = json!({
                     "$id": ref_id_counter.to_string(),
                     "$type": format!("QuadSpinner.Gaea.Nodes.Modifiers.{}, Gaea.Nodes", m.modifier_type),
@@ -288,19 +299,34 @@ fn create_node_object(node: &Node, mut ref_id_counter: u32) -> Result<(Value, u3
                     "Parent": {"$ref": node_id_ref},
                     "Intrinsic": true
                 });
+                let obj = mod_obj
+                    .as_object_mut()
+                    .expect("json! built an object just above");
+
+                // Gaea writes a modifier's settings as plain fields on the modifier itself, and
+                // marks the ones that have settings with HasUI. Dropping them left the modifier
+                // in the file with none of the values the caller asked for.
+                for (key, value) in &m.properties {
+                    obj.insert(key.clone(), value.clone());
+                }
+                if m.has_ui || !m.properties.is_empty() {
+                    obj.insert("HasUI".to_string(), json!(true));
+                }
+
                 let order = m.order.map(i64::from).or_else(|| {
                     get_intrinsic_modifiers(&node.node_type)
                         .iter()
                         .find(|(name, _)| *name == m.modifier_type)
                         .map(|(_, order)| *order)
                 });
-                if let (Some(obj), Some(order)) = (mod_obj.as_object_mut(), order) {
+                if let Some(order) = order {
                     obj.insert("Order".to_string(), json!(order));
                 }
+
                 ref_id_counter += 1;
-                mod_obj
+                Ok(mod_obj)
             })
-            .collect(),
+            .collect::<Result<Vec<Value>, String>>()?,
         None => get_intrinsic_modifiers(&node.node_type)
             .iter()
             .map(|(modifier_type, order)| {
@@ -663,6 +689,71 @@ mod tests {
                 "Deposits"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn writes_the_settings_of_a_modifier() {
+        let mut properties = HashMap::new();
+        properties.insert("Level".to_string(), serde_json::json!(0.55));
+
+        let workflow = Workflow {
+            nodes: vec![Node {
+                id: 1,
+                node_type: "Mountain".to_string(),
+                name: "Mountain".to_string(),
+                position: Position::default(),
+                properties: HashMap::new(),
+                ports: None,
+                modifiers: Some(vec![Modifier {
+                    modifier_type: "Threshold".to_string(),
+                    properties,
+                    order: None,
+                    has_ui: false,
+                }]),
+                save_definition: None,
+            }],
+            connections: vec![],
+        };
+
+        let project = generate_project("modifier", &workflow, None, None)
+            .await
+            .expect("Threshold is a real modifier");
+        let modifier =
+            &project["Assets"]["$values"][0]["Terrain"]["Nodes"]["1"]["Modifiers"]["$values"][0];
+
+        assert_eq!(modifier["Name"], "Threshold");
+        assert_eq!(modifier["Level"], 0.55, "the setting must reach the file");
+        assert_eq!(
+            modifier["HasUI"], true,
+            "Gaea marks modifiers that carry settings"
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_a_modifier_gaea_does_not_have() {
+        let workflow = Workflow {
+            nodes: vec![Node {
+                id: 1,
+                node_type: "Mountain".to_string(),
+                name: "Mountain".to_string(),
+                position: Position::default(),
+                properties: HashMap::new(),
+                ports: None,
+                modifiers: Some(vec![Modifier {
+                    modifier_type: "NotAModifier".to_string(),
+                    properties: HashMap::new(),
+                    order: None,
+                    has_ui: false,
+                }]),
+                save_definition: None,
+            }],
+            connections: vec![],
+        };
+
+        let err = generate_project("bad_modifier", &workflow, None, None)
+            .await
+            .expect_err("an unknown modifier must not reach the file");
+        assert!(err.contains("NotAModifier"), "{err}");
     }
 
     #[tokio::test]

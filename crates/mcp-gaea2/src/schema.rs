@@ -111,6 +111,19 @@ pub fn find_property(node_type: &str, property: &str) -> Option<&'static NodePro
         .find(|p| p.name == property)
 }
 
+/// Check if a modifier type exists in the installed build.
+///
+/// A modifier is serialized with its own `$type`, so an invented name breaks the project the
+/// same way an invented node type does.
+pub fn is_valid_modifier_type(modifier_type: &str) -> bool {
+    gen::MODIFIER_TYPES.contains(&modifier_type)
+}
+
+/// Every modifier type the installed build ships.
+pub fn modifier_types() -> &'static [&'static str] {
+    gen::MODIFIER_TYPES
+}
+
 /// Members of an enumerated property type, empty when the type is not an enumeration.
 pub fn enum_values(type_name: &str) -> &'static [&'static str] {
     gen::ENUM_VALUES
