@@ -19,10 +19,143 @@ use crate::types::ExecutionResult;
 /// Name of the crash log Gaea writes into the build directory when a node faults.
 const CRASH_LOG: &str = "CRASH_LOG.txt";
 
-/// Quote one argument for cmd.exe.
+/// Starting Gaea without a window, with a console, and with its exit code intact.
+///
+/// The three requirements fight each other through the standard library. Gaea.Swarm calls console
+/// APIs, so it needs standard handles that belong to a real console - a pipe or NUL makes it die
+/// with `The handle is invalid` once the project is already loaded. Rust always passes the
+/// parent's handles through STARTUPINFO, and CREATE_NEW_CONSOLE does not replace handles that
+/// were passed explicitly. Going through `cmd /c start` solved the console but opened a window
+/// per build and threw the exit code away: `start` reports success no matter what the child
+/// returned.
+///
+/// Creating the process directly settles all three: a console of its own, hidden through
+/// STARTF_USESHOWWINDOW, and the real exit code from GetExitCodeProcess.
 #[cfg(windows)]
-fn quote_for_cmd(arg: &str) -> String {
-    format!("\"{}\"", arg.replace('"', "\"\""))
+mod hidden_launch {
+    use std::ffi::OsStr;
+    use std::io;
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+    use std::ptr;
+    use std::time::Duration;
+
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+    use windows_sys::Win32::System::Threading::{
+        CreateProcessW, GetExitCodeProcess, TerminateProcess, WaitForSingleObject,
+        CREATE_NEW_CONSOLE, PROCESS_INFORMATION, STARTF_USESHOWWINDOW, STARTUPINFOW,
+    };
+
+    /// SW_HIDE: the new console exists but is never shown.
+    const SW_HIDE: u16 = 0;
+
+    /// How the child ended.
+    pub enum Outcome {
+        /// Exited on its own with this code.
+        Exited(i32),
+        /// Outlived the timeout and was terminated.
+        TimedOut,
+    }
+
+    /// Quote one argument the way `CommandLineToArgvW` reads it back.
+    fn quote(arg: &str) -> String {
+        if !arg.is_empty() && !arg.contains([' ', '\t', '"']) {
+            return arg.to_string();
+        }
+
+        let mut quoted = String::with_capacity(arg.len() + 2);
+        quoted.push('"');
+        let mut pending_backslashes = 0;
+        for ch in arg.chars() {
+            match ch {
+                '\\' => pending_backslashes += 1,
+                '"' => {
+                    // Backslashes before a quote are doubled, then the quote is escaped.
+                    for _ in 0..=pending_backslashes {
+                        quoted.push('\\');
+                    }
+                    pending_backslashes = 0;
+                    quoted.push('"');
+                },
+                _ => {
+                    for _ in 0..pending_backslashes {
+                        quoted.push('\\');
+                    }
+                    pending_backslashes = 0;
+                    quoted.push(ch);
+                },
+            }
+        }
+        // Trailing backslashes would escape the closing quote, so they are doubled too.
+        for _ in 0..pending_backslashes * 2 {
+            quoted.push('\\');
+        }
+        quoted.push('"');
+        quoted
+    }
+
+    fn to_wide(value: &OsStr) -> Vec<u16> {
+        value.encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    /// Run the executable to completion, or terminate it once the timeout passes.
+    pub fn run(exe: &Path, args: &[String], timeout: Duration) -> io::Result<Outcome> {
+        let application = to_wide(exe.as_os_str());
+
+        let mut line = quote(&exe.to_string_lossy());
+        for arg in args {
+            line.push(' ');
+            line.push_str(&quote(arg));
+        }
+        let mut command_line = to_wide(OsStr::new(&line));
+
+        // SAFETY: both buffers stay alive for the whole call, the startup info is zeroed and
+        // sized as the API requires, and every handle the call hands back is closed below.
+        unsafe {
+            let mut startup: STARTUPINFOW = std::mem::zeroed();
+            startup.cb = size_of::<STARTUPINFOW>() as u32;
+            startup.dwFlags = STARTF_USESHOWWINDOW;
+            startup.wShowWindow = SW_HIDE;
+
+            let mut info: PROCESS_INFORMATION = std::mem::zeroed();
+
+            let started = CreateProcessW(
+                application.as_ptr(),
+                command_line.as_mut_ptr(),
+                ptr::null(),
+                ptr::null(),
+                0, // handles are not inherited: this process may be speaking MCP over stdio
+                CREATE_NEW_CONSOLE,
+                ptr::null(),
+                ptr::null(),
+                &startup,
+                &mut info,
+            );
+            if started == 0 {
+                return Err(io::Error::last_os_error());
+            }
+
+            let millis = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX);
+            let waited = WaitForSingleObject(info.hProcess, millis);
+
+            let outcome = if waited == WAIT_OBJECT_0 {
+                let mut code: u32 = 0;
+                if GetExitCodeProcess(info.hProcess, &mut code) == 0 {
+                    CloseHandle(info.hThread);
+                    CloseHandle(info.hProcess);
+                    return Err(io::Error::last_os_error());
+                }
+                Outcome::Exited(code as i32)
+            } else {
+                TerminateProcess(info.hProcess, 1);
+                Outcome::TimedOut
+            };
+
+            CloseHandle(info.hThread);
+            CloseHandle(info.hProcess);
+            Ok(outcome)
+        }
+    }
 }
 
 /// Read the crash log Gaea left in the build directory, if any.
@@ -52,41 +185,40 @@ impl Gaea2CLI {
         Self { gaea_path }
     }
 
-    /// Build the command that launches Gaea with a console of its own.
+    /// Run Gaea to completion and report how it ended.
     ///
-    /// On Windows the launch goes through `cmd /c start`, and that indirection is the whole
-    /// point. Gaea.Swarm uses console APIs, so it needs standard handles that belong to a real
-    /// console. Rust always fills STARTUPINFO with the parent's handles - pipes, when this
-    /// process is speaking MCP over stdio - and CREATE_NEW_CONSOLE does not override handles
-    /// that were passed explicitly; Gaea then dies with
-    /// `System.IO.IOException: The handle is invalid` (exit code -532462766) once the project is
-    /// already loaded, which reads like a broken project rather than a broken invocation.
-    /// `start` opens the process in a window of its own, with handles to match, and `/wait`
-    /// passes its exit code back.
+    /// `Ok(Some(code))` is a finished build, `Ok(None)` a timeout.
     #[cfg(windows)]
-    fn spawn_command(&self, args: &[String]) -> Command {
-        use std::os::windows::process::CommandExt;
+    async fn run_to_completion(
+        &self,
+        args: Vec<String>,
+        timeout_secs: u64,
+    ) -> std::io::Result<Option<i32>> {
+        let exe = self.gaea_path.clone();
+        let timeout = Duration::from_secs(timeout_secs);
 
-        let quoted: Vec<String> = args.iter().map(|a| quote_for_cmd(a)).collect();
-        let line = format!(
-            "/c start \"Gaea\" /wait /min {} {}",
-            quote_for_cmd(&self.gaea_path.to_string_lossy()),
-            quoted.join(" ")
-        );
-
-        let mut cmd = Command::new("cmd.exe");
-        // raw_arg: cmd.exe parses its own command line, so the usual argument escaping would
-        // reach it doubled and `start` would take the executable path for a window title.
-        cmd.raw_arg(line);
-        cmd
+        // The wait blocks, so it belongs off the async runtime's threads.
+        tokio::task::spawn_blocking(move || match hidden_launch::run(&exe, &args, timeout)? {
+            hidden_launch::Outcome::Exited(code) => Ok(Some(code)),
+            hidden_launch::Outcome::TimedOut => Ok(None),
+        })
+        .await
+        .map_err(std::io::Error::other)?
     }
 
-    /// Build the command that launches Gaea.
+    /// Run Gaea to completion and report how it ended.
     #[cfg(not(windows))]
-    fn spawn_command(&self, args: &[String]) -> Command {
+    async fn run_to_completion(
+        &self,
+        args: Vec<String>,
+        timeout_secs: u64,
+    ) -> std::io::Result<Option<i32>> {
         let mut cmd = Command::new(&self.gaea_path);
-        cmd.args(args);
-        cmd
+        cmd.args(&args);
+        match timeout(Duration::from_secs(timeout_secs), cmd.status()).await {
+            Ok(status) => Ok(status?.code()),
+            Err(_) => Ok(None),
+        }
     }
 
     /// Run a Gaea2 project and generate terrain outputs.
@@ -217,17 +349,14 @@ impl Gaea2CLI {
         // difference rather than by an exit code that does not survive the launch.
         let files_before = find_output_files(&output_dir).await;
 
-        let mut cmd = self.spawn_command(&args);
-
         let start_time = Instant::now();
 
-        // Run with timeout
-        let result = timeout(Duration::from_secs(timeout_secs), cmd.status()).await;
+        let result = self.run_to_completion(args, timeout_secs).await;
 
         let execution_time = start_time.elapsed().as_secs_f64();
 
         match result {
-            Ok(Ok(status)) => {
+            Ok(Some(code)) => {
                 let crash = read_crash_log(&output_dir).await;
                 let crash_text = crash.as_ref().map(|(text, _)| text.clone());
                 let first_fault = crash.as_ref().and_then(|(_, fault)| fault.clone());
@@ -235,11 +364,10 @@ impl Gaea2CLI {
                 let output_files = find_output_files(&output_dir).await;
                 let wrote_something = output_files.iter().any(|f| !files_before.contains(f));
 
-                // The exit code cannot be trusted here. Gaea needs its own console, which it
-                // gets through `cmd /c start /wait`, and `start` reports success regardless of
-                // what the child returned - a build that exits 1 arrives as 0. So a build counts
-                // as successful only when it actually produced a file and left no crash log.
-                if status.success() && first_fault.is_none() && wrote_something {
+                // Gaea can exit zero and still leave a crash log for a node that faulted, and it
+                // can exit zero having computed nothing at all, so the exit code alone never
+                // decides: a build succeeded when it produced a file and left no fault behind.
+                if code == 0 && first_fault.is_none() && wrote_something {
                     let file_count = output_files.len();
 
                     ExecutionResult {
@@ -255,9 +383,9 @@ impl Gaea2CLI {
                     }
                 } else {
                     let file_count = output_files.len();
-                    let error = match (&first_fault, status.code(), wrote_something) {
+                    let error = match (&first_fault, code, wrote_something) {
                         (Some(fault), _, _) => format!("Gaea2 build failed: {fault}"),
-                        (None, Some(code), _) if code != 0 => format!(
+                        (None, code, _) if code != 0 => format!(
                             "Gaea2 exited with code {}{}",
                             code,
                             if code == -532462766 {
@@ -272,8 +400,7 @@ impl Gaea2CLI {
                                              check that the chain reaches the saved nodes and \
                                              that the nodes feeding them produce data."
                             .to_string(),
-                        (None, None, _) => "Gaea2 was terminated by a signal".to_string(),
-                        (None, Some(_), true) => "Gaea2 reported a failure".to_string(),
+                        (None, _, true) => "Gaea2 reported a failure".to_string(),
                     };
 
                     ExecutionResult {
@@ -289,21 +416,21 @@ impl Gaea2CLI {
                     }
                 }
             },
-            Ok(Err(e)) => ExecutionResult {
+            Ok(None) => ExecutionResult {
                 success: false,
-                error: Some(format!("Failed to execute Gaea2: {e}")),
-                output_dir: None,
-                output_files: vec![],
+                error: Some(format!("Process timed out after {timeout_secs} seconds")),
+                output_dir: Some(output_dir.to_string_lossy().to_string()),
+                output_files: find_output_files(&output_dir).await,
                 file_count: 0,
                 execution_time: Some(execution_time),
                 note: None,
                 stdout: None,
                 stderr: None,
             },
-            Err(_) => ExecutionResult {
+            Err(e) => ExecutionResult {
                 success: false,
-                error: Some(format!("Process timed out after {timeout_secs} seconds")),
-                output_dir: Some(output_dir.to_string_lossy().to_string()),
+                error: Some(format!("Failed to execute Gaea2: {e}")),
+                output_dir: None,
                 output_files: vec![],
                 file_count: 0,
                 execution_time: Some(execution_time),

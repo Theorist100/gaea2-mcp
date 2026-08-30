@@ -61,6 +61,11 @@ rand = "0.8"
 # Glob pattern matching for file listing
 glob = "0.3"
 
+# Gaea has to be started without a visible window and with a console of its own; the standard
+# library cannot express that combination, so the process is created directly on Windows.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
+
 [dev-dependencies]
 tokio-test = "0.4"
 
