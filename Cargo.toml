@@ -1,0 +1,88 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/mcp-gaea2",
+    "crates/mcp-core",
+    "crates/mcp-client",
+    "crates/mcp-macros",
+]
+
+# mcp-core, mcp-client and mcp-macros are vendored unchanged from the MCP core library of
+# AndrewAltimit/template-repo; see NOTICE.md. Only mcp-gaea2 is developed here.
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/Theorist100/gaea2-mcp"
+authors = ["AndrewAltimit"]
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.40", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# HTTP framework
+axum = { version = "0.7", features = ["ws"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Schema generation
+schemars = "0.8"
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# HTTP client (for client mode)
+reqwest = { version = "0.12", features = ["json"] }
+
+# UUID
+uuid = { version = "1.10", features = ["v4", "serde"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Proc macro support
+syn = { version = "2.0", features = ["full", "parsing", "extra-traits"] }
+quote = "1.0"
+proc-macro2 = "1.0"
+
+# Testing
+tokio-test = "0.4"
+axum-test = "16.0"
+
+# Internal crates
+mcp-core = { path = "crates/mcp-core" }
+mcp-client = { path = "crates/mcp-client" }
+mcp-macros = { path = "crates/mcp-macros" }
+
+[workspace.lints.clippy]
+clone_on_ref_ptr = "warn"
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+opt-level = 0
+debug = true

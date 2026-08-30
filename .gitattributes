@@ -1,0 +1,5 @@
+# rustfmt.toml sets newline_style = "Unix"; keep the working tree matching it on every
+# platform, otherwise `cargo fmt --check` fails on a fresh Windows clone.
+* text=auto eol=lf
+*.png binary
+*.terrain text eol=lf

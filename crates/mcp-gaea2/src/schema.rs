@@ -1,0 +1,317 @@
+//! Schema queries for Gaea node types, ports and properties.
+//!
+//! The data itself lives in [`crate::gaea_schema_generated`], extracted from an installed Gaea
+//! build by `tools/extract_gaea_schema.ps1`. This module only queries it.
+//!
+//! The previous hand-written list described Gaea 2.2.6.0 and had drifted from the product: it
+//! accepted 23 node types that do not exist (`Output`, `Max`, `Min`, `Multiply`, `Blend`, `Math`,
+//! `QuickColor`, `Satmaps`, `Rockmap`, `Portal*`, `Coast`, `Sediment`, ...) while rejecting 15
+//! real ones (`Invert`, `ColorThreshold`, `MathX`, `River2`, `Pond`, `Sediments`, ...). Anything
+//! built from an invented type serializes to `QuadSpinner.Gaea.Nodes.<Type>, Gaea.Nodes`, which
+//! Gaea then refuses to load as a corrupt file.
+
+use std::collections::HashSet;
+use std::sync::LazyLock;
+
+use crate::gaea_schema_generated as gen;
+
+pub use crate::gaea_schema_generated::{NodeProperty, GAEA_VERSION};
+
+/// Ports every node has unless the extracted table says otherwise.
+const FALLBACK_PORTS: &[(&str, &str)] = &[("In", "PrimaryIn"), ("Out", "PrimaryOut")];
+
+/// All node types the installed Gaea build can deserialize.
+pub static VALID_NODE_TYPES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
+    let mut types = HashSet::new();
+    for (_, nodes) in gen::NODE_CATEGORIES {
+        types.extend(nodes.iter().copied());
+    }
+    // Real classes that carry no [Toolbox] attribute - hidden from the tool box, still loadable.
+    types.extend(gen::UNCATEGORIZED_NODES.iter().copied());
+    types
+});
+
+/// Nodes that own a Seed property.
+pub static GENERATOR_NODES: LazyLock<HashSet<&'static str>> =
+    LazyLock::new(|| gen::SEEDED_NODES.iter().copied().collect());
+
+/// Nodes in the `Output` category. These write files; see also [`is_output_node`].
+pub static OUTPUT_NODES: &[&str] = gen::OUTPUT_NODES;
+
+/// Check if a node type exists in the installed Gaea build.
+pub fn is_valid_node_type(node_type: &str) -> bool {
+    VALID_NODE_TYPES.contains(node_type)
+}
+
+/// Check if a node type is a generator (has a Seed property).
+pub fn is_generator_node(node_type: &str) -> bool {
+    GENERATOR_NODES.contains(node_type)
+}
+
+/// Check if a node type belongs to the `Output` category.
+///
+/// Note that a graph can export without one: any node can carry a `SaveDefinition`, which is how
+/// most Gaea projects write their maps. Callers deciding whether a workflow produces output must
+/// consider both.
+pub fn is_output_node(node_type: &str) -> bool {
+    gen::OUTPUT_NODES.contains(&node_type)
+}
+
+/// Get the tool box category for a node type, if it has one.
+pub fn get_node_category(node_type: &str) -> Option<&'static str> {
+    gen::NODE_CATEGORIES
+        .iter()
+        .find(|(_, nodes)| nodes.contains(&node_type))
+        .map(|(category, _)| *category)
+}
+
+/// Get the port layout for a node type, in serialization order.
+///
+/// Order is significant: nodes read their inputs positionally, so an invented or reordered layout
+/// can fault the build (`Thermal2` used to be emitted with a non-existent `Talus` port and threw
+/// "Index was outside the bounds of the array"). Types absent from the extracted table fall back
+/// to plain `In`/`Out` rather than a guess.
+pub fn get_default_ports(node_type: &str) -> Vec<(&'static str, &'static str)> {
+    gen::NODE_PORTS
+        .iter()
+        .find(|(name, _)| *name == node_type)
+        .map(|(_, ports)| ports.to_vec())
+        .unwrap_or_else(|| FALLBACK_PORTS.to_vec())
+}
+
+/// Whether the port layout of this node type is known, as opposed to falling back to `In`/`Out`.
+pub fn has_known_ports(node_type: &str) -> bool {
+    gen::NODE_PORTS.iter().any(|(name, _)| *name == node_type)
+}
+
+/// Modifiers Gaea attaches to a node by itself, as `(modifier type, order)`.
+///
+/// A node serialized without them can fault at build time.
+pub fn get_intrinsic_modifiers(node_type: &str) -> &'static [(&'static str, i64)] {
+    gen::INTRINSIC_MODIFIERS
+        .iter()
+        .find(|(name, _)| *name == node_type)
+        .map(|(_, mods)| *mods)
+        .unwrap_or(&[])
+}
+
+/// Properties declared by a node type.
+pub fn get_node_properties(node_type: &str) -> &'static [NodeProperty] {
+    gen::NODE_PROPERTIES
+        .iter()
+        .find(|(name, _)| *name == node_type)
+        .map(|(_, props)| *props)
+        .unwrap_or(&[])
+}
+
+/// Look up one property of a node type.
+pub fn find_property(node_type: &str, property: &str) -> Option<&'static NodeProperty> {
+    get_node_properties(node_type)
+        .iter()
+        .find(|p| p.name == property)
+}
+
+/// Build resolutions Gaea computes at: powers of two from 256 to 8192.
+///
+/// Off-list values are not rejected by Gaea's command line - it starts the build, works through
+/// the first node and exits without writing a single file, which reads like a broken graph. The
+/// heightfield sizes offered by the `Unity` node (513, 1025, 2049, 4097) belong to that node's
+/// `TargetSize`, not here, and 2049 as a build resolution is exactly how this was hit.
+pub const BUILD_RESOLUTIONS: &[u32] = &[256, 512, 1024, 2048, 4096, 8192];
+
+/// Whether Gaea can build at this resolution.
+pub fn is_valid_build_resolution(resolution: u32) -> bool {
+    BUILD_RESOLUTIONS.contains(&resolution)
+}
+
+/// Find a valid node type close to an invalid one, for repair suggestions.
+///
+/// Exact-name aliases come first: they map names the old 2.2.6 schema used to the type the
+/// installed build actually ships.
+pub fn find_similar_node_type(invalid_type: &str) -> Option<&'static str> {
+    /// Retired names and the node that replaced them.
+    const ALIASES: &[(&str, &str)] = &[
+        ("Output", "Export"),
+        ("QuickColor", "SatMap"),
+        ("Satmaps", "SatMap"),
+        ("Colorize", "SatMap"),
+        ("Rockmap", "RockMap"),
+        ("Sediment", "Sediments"),
+        ("Mixer2", "Mixer"),
+        ("Coast", "Sea"),
+        ("Beach", "Sea"),
+        ("Fluvial", "Rivers"),
+        ("HeightMask", "Height"),
+        ("SlopeMask", "Slope"),
+        ("Math", "MathX"),
+        ("Details", "GroundTexture"),
+        ("Gradient", "LinearGradient"),
+        ("Pattern", "Shape"),
+    ];
+
+    if let Some((_, replacement)) = ALIASES
+        .iter()
+        .find(|(old, _)| old.eq_ignore_ascii_case(invalid_type))
+    {
+        return Some(replacement);
+    }
+
+    // Case-only mistakes: "erosion2" -> "Erosion2".
+    if let Some(exact) = VALID_NODE_TYPES
+        .iter()
+        .find(|t| t.eq_ignore_ascii_case(invalid_type))
+    {
+        return Some(exact);
+    }
+
+    None
+}
+
+/// Suggest nodes that would round out the current workflow.
+pub fn suggest_nodes(current_nodes: &[String], context: Option<&str>) -> Vec<String> {
+    let mut suggestions = Vec::new();
+
+    let has_generator = current_nodes.iter().any(|n| is_generator_node(n));
+    let has_erosion = current_nodes
+        .iter()
+        .any(|n| n == "Erosion2" || n == "Erosion");
+    let has_colorize = current_nodes
+        .iter()
+        .any(|n| gen::COLORIZE_NODES.contains(&n.as_str()));
+    let has_output = current_nodes.iter().any(|n| is_output_node(n));
+
+    if !has_generator {
+        suggestions.extend(["Mountain", "Perlin", "Voronoi"].map(String::from));
+    }
+    if has_generator && !has_erosion {
+        suggestions.push("Erosion2".to_string());
+    }
+    if !has_colorize {
+        suggestions.extend(["SatMap", "SuperColor"].map(String::from));
+    }
+    if !has_output {
+        suggestions.push("Export".to_string());
+    }
+
+    if let Some(ctx) = context {
+        let ctx_lower = ctx.to_lowercase();
+        if ctx_lower.contains("mountain") || ctx_lower.contains("alpine") {
+            suggestions.extend(["Snow", "Glacier", "Stones"].map(String::from));
+        } else if ctx_lower.contains("desert") || ctx_lower.contains("dune") {
+            suggestions.extend(["DuneSea", "Sandstone", "SlopeWarp"].map(String::from));
+        } else if ctx_lower.contains("coast") || ctx_lower.contains("beach") {
+            suggestions.extend(["Sea", "Lake", "Rivers"].map(String::from));
+        } else if ctx_lower.contains("volcano") {
+            suggestions.extend(["Volcano", "Thermal2", "Stratify"].map(String::from));
+        } else if ctx_lower.contains("canyon") {
+            suggestions.extend(["Canyon", "Stratify", "Rivers"].map(String::from));
+        }
+    }
+
+    suggestions.retain(|s| !current_nodes.contains(s));
+    suggestions.sort();
+    suggestions.dedup();
+    suggestions
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_types_the_installed_build_ships() {
+        assert!(is_valid_node_type("Mountain"));
+        assert!(is_valid_node_type("Erosion2"));
+        assert!(is_valid_node_type("Export"));
+        assert!(is_valid_node_type("Unity"));
+        // Present in 2.3, missing from the old hand-written schema.
+        assert!(is_valid_node_type("Sediments"));
+        assert!(is_valid_node_type("ColorThreshold"));
+        assert!(!is_valid_node_type("InvalidNode"));
+    }
+
+    #[test]
+    fn rejects_types_the_old_schema_invented() {
+        // "Output" never existed; the export node is "Export".
+        assert!(!is_valid_node_type("Output"));
+        assert!(!is_valid_node_type("Bias"));
+        assert!(!is_valid_node_type("QuickColor"));
+        assert!(!is_valid_node_type("Rockmap"));
+        assert!(!is_valid_node_type("PortalTransmit"));
+    }
+
+    #[test]
+    fn maps_retired_names_onto_shipped_ones() {
+        assert_eq!(find_similar_node_type("Output"), Some("Export"));
+        assert_eq!(find_similar_node_type("Rockmap"), Some("RockMap"));
+        assert_eq!(find_similar_node_type("Sediment"), Some("Sediments"));
+        assert_eq!(find_similar_node_type("erosion2"), Some("Erosion2"));
+        assert_eq!(find_similar_node_type("Nonsense"), None);
+    }
+
+    #[test]
+    fn generator_nodes_come_from_the_seed_property() {
+        assert!(is_generator_node("Mountain"));
+        assert!(is_generator_node("Perlin"));
+        assert!(!is_generator_node("Export"));
+        assert!(!is_generator_node("Blur"));
+    }
+
+    #[test]
+    fn categories_match_the_tool_box() {
+        assert_eq!(get_node_category("Mountain"), Some("Terrain"));
+        assert_eq!(get_node_category("Erosion2"), Some("Simulate"));
+        assert_eq!(get_node_category("Unity"), Some("Output"));
+        assert_eq!(get_node_category("Invalid"), None);
+        assert!(is_output_node("Unity"));
+        assert!(is_output_node("Export"));
+        assert!(!is_output_node("Mountain"));
+    }
+
+    #[test]
+    fn thermal2_carries_its_real_ports_and_intrinsic_modifier() {
+        let ports = get_default_ports("Thermal2");
+        let names: Vec<_> = ports.iter().map(|(n, _)| *n).collect();
+        assert_eq!(
+            names,
+            vec![
+                "In",
+                "Out",
+                "AreaMask",
+                "SedimentRemoval",
+                "Wear",
+                "Deposits"
+            ]
+        );
+        // The invented port that used to fault the build.
+        assert!(!names.contains(&"Talus"));
+        assert_eq!(get_intrinsic_modifiers("Thermal2"), &[("Max", 66)]);
+    }
+
+    #[test]
+    fn output_nodes_keep_their_out_port() {
+        // Export-class nodes were previously stripped of "Out", which Gaea does emit.
+        let ports = get_default_ports("Unity");
+        assert!(ports.iter().any(|(n, _)| *n == "Out"));
+    }
+
+    #[test]
+    fn build_resolutions_exclude_the_unity_heightfield_sizes() {
+        assert!(is_valid_build_resolution(512));
+        assert!(is_valid_build_resolution(8192));
+        // 2049 is a Unity TargetSize. As a build resolution Gaea writes no file at all.
+        assert!(!is_valid_build_resolution(2049));
+        assert!(!is_valid_build_resolution(1000));
+        assert!(!is_valid_build_resolution(0));
+    }
+
+    #[test]
+    fn properties_carry_ranges_where_gaea_declares_them() {
+        let bias = find_property("SatMap", "Bias").expect("SatMap has Bias");
+        assert_eq!(bias.min, Some(-1.0));
+        assert_eq!(bias.max, Some(1.0));
+        // Bias is a property of several nodes; it is not a node of its own.
+        assert!(find_property("Soil", "Bias").is_some());
+        assert!(!is_valid_node_type("Bias"));
+    }
+}
