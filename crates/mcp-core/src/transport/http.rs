@@ -301,7 +301,7 @@ async fn messages_post_handler(
                     responses.push(JsonRpcResponse::error_with_code(
                         id,
                         JsonRpcErrorCode::InvalidRequest,
-                        Some(format!("Invalid request in batch: {}", e)),
+                        Some(format!("Invalid request in batch: {e}")),
                     ));
                 },
             }

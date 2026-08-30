@@ -152,7 +152,7 @@ async fn call_tool_handler(
                 Json(ExecuteResponse {
                     success: false,
                     result: None,
-                    error: Some(format!("Tool '{}' not found", name)),
+                    error: Some(format!("Tool '{name}' not found")),
                 }),
             );
         },
@@ -214,7 +214,7 @@ async fn execute_handler(
                 Json(ExecuteResponse {
                     success: false,
                     result: None,
-                    error: Some(format!("Tool '{}' not found", name)),
+                    error: Some(format!("Tool '{name}' not found")),
                 }),
             );
         },
@@ -276,7 +276,7 @@ mod tests {
                 .get("message")
                 .and_then(|v| v.as_str())
                 .unwrap_or("no message");
-            Ok(ToolResult::text(format!("Echo: {}", msg)))
+            Ok(ToolResult::text(format!("Echo: {msg}")))
         }
     }
 

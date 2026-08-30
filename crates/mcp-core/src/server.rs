@@ -275,8 +275,7 @@ impl MCPServer {
             Err(e) => {
                 error!("Failed to fetch tools from backend: {}", e);
                 return Err(crate::error::MCPError::Internal(format!(
-                    "Failed to fetch backend tools: {}",
-                    e
+                    "Failed to fetch backend tools: {e}"
                 )));
             },
         };
@@ -422,8 +421,7 @@ impl Tool for ProxyToolWrapper {
                 }
             },
             Err(e) => Err(crate::error::MCPError::Internal(format!(
-                "Proxy error: {}",
-                e
+                "Proxy error: {e}"
             ))),
         }
     }

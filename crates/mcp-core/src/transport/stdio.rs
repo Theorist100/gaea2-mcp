@@ -201,7 +201,7 @@ mod tests {
         let mut stdin_writer = stdin_write;
         for req in requests {
             stdin_writer
-                .write_all(format!("{}\n", req).as_bytes())
+                .write_all(format!("{req}\n").as_bytes())
                 .await
                 .unwrap();
         }
