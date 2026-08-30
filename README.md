@@ -193,6 +193,13 @@ back. The crash log is read from the build directory afterwards.
 **Output file names** come from the source node, not from `SaveDefinition.Filename`: a `Unity`
 node fed by `Thermal2` writes `Thermal2_Out.raw`. That is Gaea's behaviour, not the server's.
 
+**A value of the wrong shape kills a build silently.** Gaea does not complain about a type
+mismatch; it fails to load the node, and the build exits 1 having written nothing, with no
+crash log — indistinguishable from a broken graph. Four shapes cause it, and the server refuses
+all four up front: an enumeration written as an ordinal (`Rivers.RiverValleyWidth = 0`), a whole
+number carrying a fraction (`Perlin.Octaves = 3.0`, `Sunlight.Latitude = 50.0`), a pair written
+as one number (`Sunlight.Year = 0.45`), and a single number written as a pair.
+
 **A property's value is not always its effect.** 42 properties carry a curve exponent, and
 some scale with the size of what they make: a `Mountain` at `Scale 0.16` with `Height 0.42`
 came out at 3% of full height and was invisible on the map. Measured across its range,

@@ -354,6 +354,42 @@ pub fn check_property_value(
     let Some(declared) = find_property(node_type, property) else {
         return Ok(());
     };
+
+    // The same failure as an enum written as an ordinal, from the other direction: a value of the
+    // wrong shape makes Gaea fail to load the node, and the build exits 1 with no files and no
+    // crash log. `Perlin.Octaves = 3.0` and `Sunlight.Latitude = 50.0` each cost a build that
+    // looked like a broken graph, and `Sunlight.Year = 0.45` is a pair written as one number.
+    match declared.cs_type {
+        "int" => {
+            if let Some(number) = value.as_f64() {
+                if number.fract() != 0.0 {
+                    return Err(format!(
+                        "'{property}' of {node_type} is a whole number and {number} has a \
+                         fractional part. Gaea would fail to load the node and the build would \
+                         write nothing. Use {}.",
+                        number.trunc()
+                    ));
+                }
+            }
+        },
+        "Float2" => {
+            if value.is_number() {
+                return Err(format!(
+                    "'{property}' of {node_type} is a pair and cannot be written as the single \
+                     value {value}. Give both components, as {{\"X\": …, \"Y\": …}}."
+                ));
+            }
+        },
+        "float" | "double" => {
+            if value.is_object() {
+                return Err(format!(
+                    "'{property}' of {node_type} is a single number, not a pair."
+                ));
+            }
+        },
+        _ => {},
+    }
+
     let allowed = enum_values(declared.cs_type);
     if allowed.is_empty() {
         return Ok(());
@@ -576,6 +612,31 @@ mod tests {
         // Plain numeric and unknown properties are left alone here.
         assert!(check_property_value("Rivers", "Water", &json!(0.5)).is_ok());
         assert!(check_property_value("Rivers", "NoSuchProperty", &json!(1)).is_ok());
+    }
+
+    #[test]
+    fn a_value_of_the_wrong_shape_is_refused() {
+        use serde_json::json;
+
+        // Each of these cost a build that exited 1 with no files and no crash log.
+        let err = check_property_value("Perlin", "Octaves", &json!(3.0_f64.next_up()))
+            .expect_err("a whole number cannot carry a fraction");
+        assert!(err.contains("whole number"), "{err}");
+        assert!(check_property_value("Perlin", "Octaves", &json!(3)).is_ok());
+        assert!(
+            check_property_value("Perlin", "Octaves", &json!(3.0)).is_ok(),
+            "3.0 is a whole number written with a decimal point and loads fine"
+        );
+
+        let err = check_property_value("Sunlight", "Year", &json!(0.45))
+            .expect_err("a pair cannot be written as one number");
+        assert!(err.contains("pair"), "{err}");
+        assert!(check_property_value("Sunlight", "Year", &json!({"X": 0.4, "Y": 0.6})).is_ok());
+
+        assert!(
+            check_property_value("Rivers", "Water", &json!({"X": 0.5, "Y": 0.5})).is_err(),
+            "a single number does not take a pair"
+        );
     }
 
     #[test]
