@@ -29,6 +29,7 @@ mod generation;
 mod schema;
 mod server;
 mod templates;
+mod terrain;
 mod types;
 mod validation;
 

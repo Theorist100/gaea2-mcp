@@ -80,6 +80,7 @@ impl Gaea2Server {
             Arc::new(ValidateRuntimeTool { refs: refs.clone() }),
             Arc::new(NodeInfoTool),
             Arc::new(AnalyzeBuildTool),
+            Arc::new(AnalyzeTerrainTool),
             Arc::new(SetSaveDefinitionTool),
             Arc::new(PatchProjectTool),
         ]
@@ -2266,6 +2267,28 @@ impl Tool for AnalyzeBuildTool {
             })
             .unwrap_or_default();
 
+        // The heightfield is the point of the build, so describe it here instead of making the
+        // caller find the file and ask again.
+        let terrain = files
+            .iter()
+            .filter_map(|f| f["name"].as_str())
+            .find(|name| name.to_lowercase().ends_with(".raw"))
+            .and_then(|name| {
+                let full = dir.join(name);
+                crate::terrain::load(&full).ok().map(|field| {
+                    let report = field.report(4800.0, 300.0, 5.0, 0.6);
+                    json!({
+                        "file": name,
+                        "resolution": report.resolution,
+                        "relief_metres": report.relief_metres,
+                        "is_flat": report.is_flat,
+                        "centre_gentle_percent": report.centre_gentle_percent,
+                        "edge_lift_metres": report.edge_lift_metres,
+                        "height_classes": report.height_classes,
+                    })
+                })
+            });
+
         ToolResult::json(&json!({
             "build_dir": build_dir,
             "file_count": files.len(),
@@ -2274,8 +2297,101 @@ impl Tool for AnalyzeBuildTool {
             "crashed": first_fault.is_some(),
             "first_fault": first_fault,
             "crash_log": crash_log,
-            "expected_files": expected
+            "expected_files": expected,
+            "terrain": terrain
         }))
+    }
+}
+
+// =============================================================================
+// Tool: analyze_gaea2_terrain
+// =============================================================================
+
+/// Answers questions about the land a build produced, not about its files.
+struct AnalyzeTerrainTool;
+
+#[async_trait]
+impl Tool for AnalyzeTerrainTool {
+    fn name(&self) -> &str {
+        "analyze_gaea2_terrain"
+    }
+
+    fn description(&self) -> &str {
+        "Read a built heightfield (.raw or .png) and describe the terrain: relief in metres, how \
+         much of the playable middle is gentle enough to build on, whether the edges stand above \
+         that middle, the split into lowland / plain / commanding height, and profiles across \
+         both axes. Says outright when the field is flat."
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Heightfield written by a build: .raw (16-bit) or .png"
+                },
+                "metres_across": {
+                    "type": "number",
+                    "description": "Width of the map in metres",
+                    "default": 4800
+                },
+                "metres_up": {
+                    "type": "number",
+                    "description": "Metres between the lowest and highest possible point",
+                    "default": 300
+                },
+                "gentle_degrees": {
+                    "type": "number",
+                    "description": "Slope up to which ground counts as buildable",
+                    "default": 5
+                },
+                "centre_fraction": {
+                    "type": "number",
+                    "description": "Share of the map treated as the playable middle; the rest is the frame",
+                    "default": 0.6
+                }
+            },
+            "required": ["path"]
+        })
+    }
+
+    async fn execute(&self, args: Value) -> Result<ToolResult> {
+        let path = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| MCPError::InvalidParameters("Missing 'path'".to_string()))?;
+
+        let number =
+            |key: &str, fallback: f64| args.get(key).and_then(Value::as_f64).unwrap_or(fallback);
+
+        let field = crate::terrain::load(std::path::Path::new(path))
+            .map_err(MCPError::InvalidParameters)?;
+
+        let report = field.report(
+            number("metres_across", 4800.0),
+            number("metres_up", 300.0),
+            number("gentle_degrees", 5.0),
+            number("centre_fraction", 0.6),
+        );
+
+        let mut value = serde_json::to_value(&report)
+            .map_err(|e| MCPError::Internal(format!("Cannot serialise the report: {e}")))?;
+        value["path"] = json!(path);
+
+        // A one-line read of the shape, so the numbers do not have to be interpreted every time.
+        let shape = if report.is_flat {
+            "flat: the graph produced no relief at all"
+        } else if report.edge_lift_metres > 20.0 {
+            "a basin: edges stand above the middle, which is what a playable map wants"
+        } else if report.edge_lift_metres < -20.0 {
+            "a mound: the middle stands above the edges, so the playable area is the slope"
+        } else {
+            "even: no strong difference between the middle and the frame"
+        };
+        value["shape"] = json!(shape);
+
+        ToolResult::json(&value)
     }
 }
 

@@ -61,6 +61,10 @@ rand = "0.8"
 # Glob pattern matching for file listing
 glob = "0.3"
 
+# Reading back the heightfields Gaea writes, to answer questions about the terrain itself
+# rather than about the files.
+png = "0.17"
+
 # Gaea has to be started without a visible window and with a console of its own; the standard
 # library cannot express that combination, so the process is created directly on Windows.
 [target.'cfg(windows)'.dependencies]
